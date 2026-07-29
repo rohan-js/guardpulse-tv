@@ -10,6 +10,13 @@ import com.guardpulse.parentcontrol.shared.PackageKeys
 import com.guardpulse.parentcontrol.shared.PinHasher
 import com.guardpulse.parentcontrol.shared.PolicyConstants
 
+internal fun encodedPolicyValues(
+    policies: Map<String, ParentPolicy>,
+    valueFactory: (String, ParentPolicy) -> Map<String, Any?>
+): Map<String, Map<String, Any?>> = policies.map { (packageName, policy) ->
+    PackageKeys.encode(packageName) to valueFactory(packageName, policy)
+}.toMap()
+
 class ParentRepository(
     private val database: DatabaseReference,
     private val auth: FirebaseAuth = FirebaseAuth.getInstance(),
@@ -63,9 +70,7 @@ class ParentRepository(
                 "revisionId" to revisionId,
                 "updatedAt" to ServerValue.TIMESTAMP,
                 "updatedBy" to uid,
-                "apps" to policies.mapKeys { PackageKeys.encode(it.key) }.mapValues { (packageName, policy) ->
-                    appPolicyValue(packageName, policy)
-                },
+                "apps" to encodedPolicyValues(policies, ::appPolicyValue),
                 "modes" to modes.associate { mode -> mode.modeId to modeValue(mode) },
                 "activeMode" to activeMode.modeId?.let {
                     mapOf(
@@ -370,9 +375,7 @@ class ParentRepository(
         "name" to mode.name,
         "createdAt" to mode.createdAt,
         "updatedAt" to mode.updatedAt,
-        "apps" to mode.appPolicies.mapKeys { PackageKeys.encode(it.key) }.mapValues { (packageName, policy) ->
-            appPolicyValue(packageName, policy)
-        }
+        "apps" to encodedPolicyValues(mode.appPolicies, ::appPolicyValue)
     )
 
     private fun requireUid(onError: (String) -> Unit): String? {

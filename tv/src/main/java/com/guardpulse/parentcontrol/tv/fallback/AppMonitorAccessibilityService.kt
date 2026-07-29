@@ -17,8 +17,7 @@ class AppMonitorAccessibilityService : AccessibilityService() {
     private lateinit var localPolicyStore: LocalPolicyStore
     private lateinit var fallbackStore: FallbackStateStore
     private lateinit var usageTracker: UsageTracker
-    private var lastLockedKey: String? = null
-    private var lastLockAt = 0L
+    private val lockLaunchGuard = LockLaunchGuard()
     private var lastLiveLimitCheckAt = 0L
     private var lastLiveLimitCheckPackage: String? = null
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -108,13 +107,8 @@ class AppMonitorAccessibilityService : AccessibilityService() {
             fallbackStore = fallbackStore,
             settingsSection = settingsSection
         )
-        if (!decision.locked) return
-
         val now = System.currentTimeMillis()
-        val lockKey = listOfNotNull(packageName, decision.reason, decision.settingsSectionKey).joinToString(":")
-        if (lastLockedKey == lockKey && now - lastLockAt < 1_500L) return
-        lastLockedKey = lockKey
-        lastLockAt = now
+        val launch = lockLaunchGuard.evaluate(packageName, decision, now) ?: return
         if (decision.reason == PolicyConstants.BLOCK_REASON_RISKY_SETTINGS ||
             decision.reason == PolicyConstants.BLOCK_REASON_SETTINGS_SECTION
         ) {
@@ -122,9 +116,9 @@ class AppMonitorAccessibilityService : AccessibilityService() {
         }
         FallbackProtection.openLock(
             this,
-            decision.policyPackage ?: packageName,
-            decision.reason ?: PolicyConstants.BLOCK_REASON_MANUAL,
-            decision.settingsSectionKey
+            launch.packageName,
+            launch.reason,
+            launch.settingsSectionKey
         )
     }
 

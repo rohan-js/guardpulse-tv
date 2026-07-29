@@ -266,6 +266,7 @@ test("parent writes coherent V2 control and desired revision while TV cannot", a
     updatedBy: "parentUid",
     apps: {
       Y29tLnZpZGVv: {
+        packageKey: "Y29tLnZpZGVv",
         packageName: "com.video",
         manualBlocked: true,
         dailyLimitMinutes: 30,
@@ -278,6 +279,7 @@ test("parent writes coherent V2 control and desired revision while TV cannot", a
         name: "Study",
         apps: {
           Y29tLnZpZGVv: {
+            packageKey: "Y29tLnZpZGVv",
             packageName: "com.video",
             manualBlocked: true,
           },
@@ -577,6 +579,45 @@ test("request identity fields are immutable after creation", async () => {
       status: "approved",
       updatedAt: 2,
       updatedBy: "parentUid",
+    })
+  );
+});
+
+test("runtime and request contracts reject unknown fields", async () => {
+  await assertFails(
+    dbAs("tvUid").ref("devices/tv1/state/apps/Y29tLnZpZGVv").set({
+      packageName: "com.video",
+      requestedSuspended: false,
+      enforcementMode: "fallback",
+      fallbackLocked: false,
+      usageMinutesToday: 0,
+      injected: true,
+    })
+  );
+  await assertFails(
+    dbAs("tvUid").ref("devices/tv1/sync/runtime").set({
+      connected: true,
+      protocolVersion: 2,
+      injected: true,
+    })
+  );
+  await assertFails(
+    dbAs("parentUid").ref("devices/tv1/commands/unknownField").set({
+      type: "rescanApps",
+      status: "pending",
+      createdAt: 1,
+      requestedBy: "parentUid",
+      injected: true,
+    })
+  );
+  await assertFails(
+    dbAs("tvUid").ref("devices/tv1/unlockRequests/unknownField").set({
+      requestId: "unknownField",
+      packageName: "com.video",
+      reason: "manual",
+      status: "pending",
+      createdAt: 1,
+      injected: true,
     })
   );
 });

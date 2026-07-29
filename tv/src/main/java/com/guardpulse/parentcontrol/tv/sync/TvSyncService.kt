@@ -116,12 +116,14 @@ class TvSyncService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_RESCAN_APPS -> uploadAppInventory()
-            ACTION_RECONCILE -> applyPoliciesAndUpload()
+            ACTION_RESCAN_APPS -> enqueueSyncWork("inventory") { awaitInventoryUpload() }
+            ACTION_RECONCILE -> enqueueSyncWork("state") { awaitPolicyReconciliation() }
             ACTION_FOREGROUND_CHANGED -> {
-                applyPoliciesAndUpload()
-                lastUsageWritePackage = fallbackStore.liveForegroundSession()?.packageName
-                updateSecurityRuntime()
+                enqueueSyncWork("foreground") {
+                    awaitPolicyReconciliation()
+                    lastUsageWritePackage = fallbackStore.liveForegroundSession()?.packageName
+                    updateSecurityRuntime()
+                }
             }
         }
         return START_STICKY
@@ -171,9 +173,11 @@ class TvSyncService : Service() {
         startSyncEngine()
         registerDevice(user.uid)
         recoverPairingStatus()
-        uploadAppInventory()
         attachFirebaseListeners()
-        updateHeartbeat()
+        enqueueSyncWork("startup") {
+            awaitInventoryUpload()
+            updateHeartbeat()
+        }
     }
 
     private fun startSyncEngine() {
@@ -208,6 +212,47 @@ class TvSyncService : Service() {
         ).also { it.start() }
     }
 
+    private fun enqueueSyncWork(channel: String, operation: suspend () -> Unit) {
+        val engine = syncEngine
+        if (engine != null) {
+            engine.submit(channel, operation)
+        } else {
+            handler.post {
+                when (channel) {
+                    "inventory" -> uploadAppInventory()
+                    "usage" -> uploadForegroundUsage()
+                    else -> applyPoliciesAndUpload()
+                }
+            }
+        }
+    }
+
+    private suspend fun awaitPolicyReconciliation(
+        appliedRevision: SyncDesiredRevision? = null
+    ) {
+        suspendCancellableCoroutine { continuation ->
+            applyPoliciesAndUpload(appliedRevision = appliedRevision) {
+                if (continuation.isActive) continuation.resume(Unit)
+            }
+        }
+    }
+
+    private suspend fun awaitInventoryUpload() {
+        suspendCancellableCoroutine { continuation ->
+            uploadAppInventory {
+                if (continuation.isActive) continuation.resume(Unit)
+            }
+        }
+    }
+
+    private suspend fun awaitForegroundUsageUpload() {
+        suspendCancellableCoroutine { continuation ->
+            uploadForegroundUsage {
+                if (continuation.isActive) continuation.resume(Unit)
+            }
+        }
+    }
+
     private fun scheduleFirebaseRetry() {
         handler.removeCallbacks(retryFirebaseRunnable)
         handler.postDelayed(retryFirebaseRunnable, authRetryDelayMs)
@@ -240,13 +285,57 @@ class TvSyncService : Service() {
     }
 
     private fun registerValueListener(query: Query, listener: ValueEventListener) {
-        query.addValueEventListener(listener)
-        valueListeners += query to listener
+        val serialized = object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                val engine = syncEngine
+                if (engine == null) {
+                    listener.onDataChange(snapshot)
+                } else {
+                    engine.submit { listener.onDataChange(snapshot) }
+                }
+            }
+
+            override fun onCancelled(error: DatabaseError) {
+                listener.onCancelled(error)
+            }
+        }
+        query.addValueEventListener(serialized)
+        valueListeners += query to serialized
     }
 
     private fun registerChildListener(query: Query, listener: ChildEventListener) {
-        query.addChildEventListener(listener)
-        childListeners += query to listener
+        val serialized = object : ChildEventListener {
+            override fun onChildAdded(snapshot: DataSnapshot, previousChildName: String?) {
+                submit { listener.onChildAdded(snapshot, previousChildName) }
+            }
+
+            override fun onChildChanged(snapshot: DataSnapshot, previousChildName: String?) {
+                submit { listener.onChildChanged(snapshot, previousChildName) }
+            }
+
+            override fun onChildRemoved(snapshot: DataSnapshot) {
+                submit { listener.onChildRemoved(snapshot) }
+            }
+
+            override fun onChildMoved(snapshot: DataSnapshot, previousChildName: String?) {
+                submit { listener.onChildMoved(snapshot, previousChildName) }
+            }
+
+            override fun onCancelled(error: DatabaseError) {
+                listener.onCancelled(error)
+            }
+
+            private fun submit(operation: () -> Unit) {
+                val engine = syncEngine
+                if (engine == null) {
+                    operation()
+                } else {
+                    engine.submit { operation() }
+                }
+            }
+        }
+        query.addChildEventListener(serialized)
+        childListeners += query to serialized
     }
 
     private fun recordSyncError(message: String?, channel: String = "firebase") {
@@ -288,7 +377,7 @@ class TvSyncService : Service() {
         if (syncLocalStore.dirtyChannels().isEmpty()) clearSyncError()
     }
 
-    private fun onFirebaseReconnected(sessionId: String?) {
+    private suspend fun onFirebaseReconnected(sessionId: String?) {
         val root = db ?: return
         fallbackStore.saveServerTimeOffset(serverClock.offsetMillis())
         FirebaseAuth.getInstance().currentUser?.uid?.let(::registerDevice)
@@ -313,18 +402,11 @@ class TvSyncService : Service() {
                 .onDisconnect()
                 .updateChildren(mapOf("online" to false, "lastSeen" to ServerValue.TIMESTAMP))
         }
-        val pendingRevision = syncLocalStore.pendingAppliedRevision()
-        applyPoliciesAndUpload(
-            appliedRevision = pendingRevision?.let {
-                SyncDesiredRevision(
-                    revisionId = it,
-                    kind = PolicyConstants.REVISION_MIGRATION,
-                    target = "reconnect"
-                )
-            }
-        )
+        // The control/desired listeners will replay the newest matching revision.
+        // Reconcile runtime state here without acknowledging a potentially stale cached revision.
+        awaitPolicyReconciliation()
         updateHeartbeat()
-        uploadAppInventory()
+        awaitInventoryUpload()
         TamperEventQueue.flush(this)
     }
 
@@ -512,7 +594,8 @@ class TvSyncService : Service() {
                 }
 
                 override fun onCancelled(error: DatabaseError) {
-                    Log.w(TAG, "Could not recover pairing status: ${error.message}")
+                    Log.w(TAG, "Could not recover pairing status")
+                    recordSyncError(error.message, "pairing")
                 }
             })
     }
@@ -1230,14 +1313,23 @@ class TvSyncService : Service() {
         }
     }
 
-    private fun uploadForegroundUsage() {
-        val root = db ?: return
-        val session = fallbackStore.liveForegroundSession() ?: return
+    private fun uploadForegroundUsage(onComplete: ((Result<Unit>) -> Unit)? = null) {
+        val root = db ?: run {
+            onComplete?.invoke(Result.failure(IllegalStateException("Firebase is unavailable")))
+            return
+        }
+        val session = fallbackStore.liveForegroundSession() ?: run {
+            onComplete?.invoke(Result.success(Unit))
+            return
+        }
         val packageName = session.packageName
         val rawUsageMs = usageTracker.effectiveUsageMillisToday(
             session,
             fallbackStore.committedUsageMillisToday()
-        )[packageName] ?: return
+        )[packageName] ?: run {
+            onComplete?.invoke(Result.success(Unit))
+            return
+        }
         val offsetMs = localPolicyStore.loadUsageOffsetsMs()[packageName] ?: 0L
         val usageMs = (rawUsageMs - offsetMs).coerceAtLeast(0L)
         val statePath = FirebasePaths.deviceStateApp(deviceId, packageName)
@@ -1264,9 +1356,13 @@ class TvSyncService : Service() {
             }
         lastUsageWritePackage = packageName
         root.updateChildren(updates)
-            .addOnSuccessListener { markChannelSynced("usage") }
+            .addOnSuccessListener {
+                markChannelSynced("usage")
+                onComplete?.invoke(Result.success(Unit))
+            }
             .addOnFailureListener { error ->
                 recordSyncError(error.message ?: "Foreground usage upload failed", "usage")
+                onComplete?.invoke(Result.failure(error))
             }
     }
 
@@ -1299,15 +1395,17 @@ class TvSyncService : Service() {
     private val tickRunnable = object : Runnable {
         override fun run() {
             policyController.applyHardening()
-            applyPoliciesAndUpload()
-            updateHeartbeat()
+            enqueueSyncWork("heartbeat-cycle") {
+                awaitPolicyReconciliation()
+                updateHeartbeat()
+            }
             handler.postDelayed(this, PolicyConstants.HEARTBEAT_INTERVAL_MS)
         }
     }
 
     private val foregroundUsageRunnable = object : Runnable {
         override fun run() {
-            uploadForegroundUsage()
+            enqueueSyncWork("usage") { awaitForegroundUsageUpload() }
             handler.postDelayed(this, PolicyConstants.FOREGROUND_USAGE_UPLOAD_INTERVAL_MS)
         }
     }

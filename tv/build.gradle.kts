@@ -97,6 +97,11 @@ android {
     buildFeatures {
         buildConfig = true
     }
+
+    lint {
+        // The TV service is intentionally hidden and is opened only through the paired parent.
+        disable += "MissingLeanbackLauncher"
+    }
 }
 
 val verifyTvReleaseConfiguration = tasks.register("verifyTvReleaseConfiguration") {

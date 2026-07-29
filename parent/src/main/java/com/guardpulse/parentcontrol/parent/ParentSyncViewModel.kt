@@ -1,7 +1,6 @@
 package com.guardpulse.parentcontrol.parent
 
 import android.app.Application
-import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.database.FirebaseDatabase
@@ -119,9 +118,9 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun createPairRequest(payload: String, manualDeviceId: String, manualCode: String) {
-        val parsed = parsePairPayload(payload)
-        val deviceId = parsed.first ?: manualDeviceId
-        val secret = parsed.second
+        val parsed = parsePairingPayload(payload)
+        val deviceId = parsed.deviceId ?: manualDeviceId
+        val secret = parsed.secret
         if (deviceId.isBlank()) {
             setMessage("Enter a TV device ID or paste the QR payload.")
             return
@@ -152,16 +151,13 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
         val current = state.value
         current.selectedDeviceId ?: return setMessage("Select a TV first")
         val app = current.apps[packageName]
-        if (app?.blockable == false) return setMessage("This app is protected: ${app.protectedReason ?: "not blockable"}")
-        if (policy.dailyLimitMinutes != null && policy.dailyLimitMinutes !in 1..1440) {
-            return setMessage("Daily limit must be between 1 and 1440 minutes")
-        }
+        policyValidationMessage(app, policy)?.let { return setMessage(it) }
         submitControlOperation(ControlOperation.UpdatePolicy(packageName, policy))
     }
 
     fun setPin(pin: String) {
         state.value.selectedDeviceId ?: return setMessage("Select a TV before setting a PIN")
-        if (!pin.matches(Regex("\\d{6}"))) return setMessage("PIN must be 6 digits")
+        pinValidationMessage(pin)?.let { return setMessage(it) }
         submitControlOperation(ControlOperation.SetPin(pin))
     }
 
@@ -208,14 +204,14 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
     fun createMode(name: String) {
         state.value.selectedDeviceId ?: return setMessage("Select a TV first")
         val trimmed = name.trim()
-        if (trimmed.isBlank()) return setMessage("Mode name cannot be empty")
+        modeNameValidationMessage(trimmed)?.let { return setMessage(it) }
         submitControlOperation(ControlOperation.CreateMode(trimmed))
     }
 
     fun renameMode(modeId: String, name: String) {
         state.value.selectedDeviceId ?: return
         val trimmed = name.trim()
-        if (trimmed.isBlank()) return setMessage("Mode name cannot be empty")
+        modeNameValidationMessage(trimmed)?.let { return setMessage(it) }
         submitControlOperation(ControlOperation.RenameMode(modeId, trimmed))
     }
 
@@ -228,12 +224,7 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
     fun updateModePolicy(modeId: String, packageName: String, policy: ParentPolicy) {
         val current = state.value
         current.selectedDeviceId ?: return setMessage("Select a TV first")
-        if (current.apps[packageName]?.blockable == false) {
-            return setMessage("This app is protected: ${current.apps[packageName]?.protectedReason ?: "not blockable"}")
-        }
-        if (policy.dailyLimitMinutes != null && policy.dailyLimitMinutes !in 1..1440) {
-            return setMessage("Daily limit must be between 1 and 1440 minutes")
-        }
+        policyValidationMessage(current.apps[packageName], policy)?.let { return setMessage(it) }
         submitControlOperation(ControlOperation.UpdateModePolicy(modeId, packageName, policy))
     }
 
@@ -244,7 +235,7 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
 
     fun startSafeMode(durationMinutes: Int) {
         state.value.selectedDeviceId ?: return setMessage("Select a TV first")
-        if (durationMinutes !in 1..1440) return setMessage("Safe Mode duration must be between 1 and 1440 minutes")
+        safeModeValidationMessage(durationMinutes)?.let { return setMessage(it) }
         submitControlOperation(ControlOperation.StartSafeMode(durationMinutes))
     }
 
@@ -312,11 +303,11 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
             uid,
             onDevices = { devices ->
                 setState { current -> current.copy(devices = devices, loadingDevices = false) }
-                val selected = state.value.selectedDeviceId
-                    ?.takeIf { id -> devices.any { it.deviceId == id } }
-                    ?: selectionPrefs.getString("selectedDeviceId", null)
-                        ?.takeIf { id -> devices.any { it.deviceId == id } }
-                    ?: devices.singleOrNull()?.deviceId
+                val selected = preferredDeviceId(
+                    devices = devices,
+                    currentId = state.value.selectedDeviceId,
+                    persistedId = selectionPrefs.getString("selectedDeviceId", null)
+                )
                 if (selected != null && selected != state.value.selectedDeviceId) {
                     selectDevice(selected)
                 } else if (selected == null && state.value.selectedDeviceId != null) {
@@ -553,23 +544,11 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     private fun validateAuthInput(email: String, password: String): Boolean {
-        if (email.isBlank()) {
-            setMessage("Enter an email address")
-            return false
-        }
-        if (password.length < 6) {
-            setMessage("Password must be at least 6 characters")
+        authValidationMessage(email, password)?.let {
+            setMessage(it)
             return false
         }
         return true
-    }
-
-    private fun parsePairPayload(payload: String): Pair<String?, String?> {
-        if (payload.isBlank()) return null to null
-        return runCatching {
-            val uri = Uri.parse(payload)
-            uri.getQueryParameter("deviceId") to uri.getQueryParameter("secret")
-        }.getOrElse { null to null }
     }
 
     private fun resumePairRequestObserver() {

@@ -35,21 +35,25 @@ class TvSyncEngine(
         suspend fun onSyncListenerError(channel: String, error: DatabaseError)
     }
 
-    private sealed interface Event {
-        data class Connection(val connected: Boolean) : Event
-        data class Control(val snapshot: DataSnapshot) : Event
-        data class Desired(val snapshot: DataSnapshot) : Event
-        data class ListenerError(val channel: String, val error: DatabaseError) : Event
-        data object Reconcile : Event
-        data object RetryListeners : Event
+    private sealed interface TvSyncEvent {
+        data class Connection(val connected: Boolean) : TvSyncEvent
+        data class Control(val snapshot: DataSnapshot) : TvSyncEvent
+        data class Desired(val snapshot: DataSnapshot) : TvSyncEvent
+        data class ListenerError(val channel: String, val error: DatabaseError) : TvSyncEvent
+        data class Work(val operation: suspend () -> Unit) : TvSyncEvent
+        data class CoalescedWork(val channel: String) : TvSyncEvent
+        data object Reconcile : TvSyncEvent
+        data object RetryListeners : TvSyncEvent
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val events = Channel<Event>(Channel.UNLIMITED)
+    private val events = Channel<TvSyncEvent>(Channel.UNLIMITED)
     private val registrations = mutableListOf<Pair<DatabaseReference, ValueEventListener>>()
+    private val pendingWork = mutableMapOf<String, suspend () -> Unit>()
+    private val queuedWorkChannels = mutableSetOf<String>()
+    private val revisionTracker = RevisionGenerationTracker()
     private var pendingSnapshot: ControlSnapshotV2? = null
     private var pendingDesired: SyncDesiredRevision? = null
-    private var generation = 0L
     private var sessionId: String? = null
     private var retryDelayMs = INITIAL_RETRY_MS
     private var reconcileJob: Job? = null
@@ -80,20 +84,35 @@ class TvSyncEngine(
     fun usesV2(): Boolean = localStore.isV2Activated()
     fun currentSessionId(): String? = sessionId
 
-    fun isCurrent(generation: Long, revisionId: String): Boolean {
-        return this.generation == generation && pendingSnapshot?.revisionId == revisionId
+    fun submit(
+        channel: String? = null,
+        operation: suspend () -> Unit
+    ) {
+        if (!started) return
+        if (channel == null) {
+            events.trySend(TvSyncEvent.Work(operation))
+            return
+        }
+        pendingWork[channel] = operation
+        if (queuedWorkChannels.add(channel)) {
+            events.trySend(TvSyncEvent.CoalescedWork(channel))
+        }
     }
 
-    private suspend fun handle(event: Event) {
+    fun isCurrent(generation: Long, revisionId: String): Boolean {
+        return revisionTracker.isCurrent(generation, revisionId)
+    }
+
+    private suspend fun handle(event: TvSyncEvent) {
         when (event) {
-            is Event.Connection -> {
+            is TvSyncEvent.Connection -> {
                 if (event.connected) {
                     retryDelayMs = INITIAL_RETRY_MS
                     sessionId = UUID.randomUUID().toString()
                 }
                 callback.onConnectionChanged(event.connected, sessionId)
             }
-            is Event.Control -> {
+            is TvSyncEvent.Control -> {
                 if (!event.snapshot.exists()) {
                     if (localStore.isV2Activated()) {
                         callback.onControlRejected(
@@ -117,16 +136,21 @@ class TvSyncEngine(
                         }
                 }
             }
-            is Event.Desired -> {
+            is TvSyncEvent.Desired -> {
                 pendingDesired = ControlProtocol.parseDesired(event.snapshot)
                 scheduleReconcile()
             }
-            is Event.ListenerError -> {
+            is TvSyncEvent.ListenerError -> {
                 callback.onSyncListenerError(event.channel, event.error)
                 scheduleRetry()
             }
-            Event.Reconcile -> dispatchNewestControl()
-            Event.RetryListeners -> {
+            is TvSyncEvent.Work -> event.operation()
+            is TvSyncEvent.CoalescedWork -> {
+                queuedWorkChannels.remove(event.channel)
+                pendingWork.remove(event.channel)?.invoke()
+            }
+            TvSyncEvent.Reconcile -> dispatchNewestControl()
+            TvSyncEvent.RetryListeners -> {
                 detachListeners()
                 attachListeners()
             }
@@ -136,16 +160,24 @@ class TvSyncEngine(
     private fun attachListeners() {
         if (!started || registrations.isNotEmpty()) return
         register(database.getReference(".info/connected"), "connection") {
-            Event.Connection(it.getValue(Boolean::class.java) ?: false)
+            TvSyncEvent.Connection(it.getValue(Boolean::class.java) ?: false)
         }
-        register(database.getReference(FirebasePaths.deviceControlV2(deviceId)), "controlV2", Event::Control)
-        register(database.getReference(FirebasePaths.deviceSyncDesired(deviceId)), "desiredRevision", Event::Desired)
+        register(
+            database.getReference(FirebasePaths.deviceControlV2(deviceId)),
+            "controlV2",
+            TvSyncEvent::Control
+        )
+        register(
+            database.getReference(FirebasePaths.deviceSyncDesired(deviceId)),
+            "desiredRevision",
+            TvSyncEvent::Desired
+        )
     }
 
     private fun register(
         ref: DatabaseReference,
         channel: String,
-        eventFactory: (DataSnapshot) -> Event
+        eventFactory: (DataSnapshot) -> TvSyncEvent
     ) {
         val listener = object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
@@ -153,7 +185,7 @@ class TvSyncEngine(
             }
 
             override fun onCancelled(error: DatabaseError) {
-                events.trySend(Event.ListenerError(channel, error))
+                events.trySend(TvSyncEvent.ListenerError(channel, error))
             }
         }
         registrations += ref to listener
@@ -164,22 +196,27 @@ class TvSyncEngine(
         reconcileJob?.cancel()
         reconcileJob = scope.launch {
             delay(CONTROL_DEBOUNCE_MS)
-            events.send(Event.Reconcile)
+            events.send(TvSyncEvent.Reconcile)
         }
     }
 
     private suspend fun dispatchNewestControl() {
         val control = pendingSnapshot ?: return
         val desired = pendingDesired
+        if (localStore.lastAppliedV2Revision() == control.revisionId &&
+            localStore.pendingAppliedRevision() == null
+        ) {
+            return
+        }
         if (desired != null && desired.revisionId != control.revisionId) {
             reconcileJob?.cancel()
             reconcileJob = scope.launch {
                 delay(REVISION_SETTLE_RETRY_MS)
-                events.send(Event.Reconcile)
+                events.send(TvSyncEvent.Reconcile)
             }
             return
         }
-        generation += 1
+        val generation = revisionTracker.advance(control.revisionId)
         callback.onControlReady(control, desired, generation)
     }
 
@@ -190,7 +227,7 @@ class TvSyncEngine(
         retryDelayMs = (retryDelayMs * 2).coerceAtMost(MAX_RETRY_MS)
         retryJob = scope.launch {
             delay(delayMs)
-            events.send(Event.RetryListeners)
+            events.send(TvSyncEvent.RetryListeners)
         }
     }
 

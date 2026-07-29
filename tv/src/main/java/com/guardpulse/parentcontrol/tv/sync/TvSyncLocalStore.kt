@@ -2,11 +2,17 @@ package com.guardpulse.parentcontrol.tv.sync
 
 import android.content.Context
 import com.guardpulse.parentcontrol.shared.ControlSnapshotV2
+import com.guardpulse.parentcontrol.tv.security.SecureValueStore
 import org.json.JSONArray
 import org.json.JSONObject
 
 class TvSyncLocalStore(context: Context) {
     private val prefs = context.getSharedPreferences("tv_sync_runtime", Context.MODE_PRIVATE)
+    private val secureStore = SecureValueStore(
+        context,
+        "tv_sync_runtime",
+        "guardpulse.sync.snapshot"
+    )
 
     fun activateV2(revisionId: String) {
         prefs.edit()
@@ -20,12 +26,12 @@ class TvSyncLocalStore(context: Context) {
     fun lastV2Revision(): String? = prefs.getString("lastV2Revision", null)
 
     fun saveValidV2Snapshot(snapshot: ControlSnapshotV2) {
-        prefs.edit()
-            .putString("lastValidV2Snapshot", JSONObject(snapshot.toFirebaseMap()).toString())
-            .apply()
+        secureStore.put("lastValidV2Snapshot", JSONObject(snapshot.toFirebaseMap()).toString())
+        prefs.edit().remove("lastValidV2Snapshot").apply()
     }
 
-    fun lastValidV2SnapshotJson(): String? = prefs.getString("lastValidV2Snapshot", null)
+    fun lastValidV2SnapshotJson(): String? =
+        secureStore.migratePlaintext("lastValidV2Snapshot")
 
     fun saveAppliedV2Revision(revisionId: String) {
         prefs.edit().putString("lastAppliedV2Revision", revisionId).apply()
@@ -69,10 +75,11 @@ class TvSyncLocalStore(context: Context) {
     fun isCommandProcessed(commandId: String): Boolean = commandId in processedCommands()
 
     fun markCommandProcessed(commandId: String) {
-        val commands = processedCommands().toMutableList()
-        commands.remove(commandId)
-        commands.add(commandId)
-        while (commands.size > MAX_PROCESSED_COMMANDS) commands.removeAt(0)
+        val commands = appendProcessedCommand(
+            processedCommands(),
+            commandId,
+            MAX_PROCESSED_COMMANDS
+        )
         prefs.edit().putString("processedCommands", JSONArray(commands).toString()).apply()
     }
 

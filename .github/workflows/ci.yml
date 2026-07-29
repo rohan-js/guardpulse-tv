@@ -1,0 +1,47 @@
+name: Android and Firebase CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Make Gradle wrapper executable
+        run: chmod +x gradlew
+      - name: Unit tests
+        run: ./gradlew --no-daemon --console=plain test
+      - name: Public debug builds
+        run: ./gradlew --no-daemon --console=plain :tv:assembleDebug :parent:assembleDebug
+      - name: Lint
+        run: ./gradlew --no-daemon --console=plain lint
+
+  firebase-rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: firebase/package-lock.json
+      - run: npm ci --prefix firebase
+      - run: npm install --global firebase-tools
+      - name: Firebase Realtime Database rules
+        run: firebase emulators:exec --project guardpulse-parental-control-test --only database "npm --prefix firebase test"

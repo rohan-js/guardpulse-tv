@@ -47,7 +47,7 @@ object SettingsSectionDetector {
             ?.let { node -> nodeText(node) }
             .orEmpty()
         val windowText = buildString {
-            root?.let { collectText(it, this, 0) }
+            root?.let { collectText(it, this, 0, NodeBudget(MAX_NODES)) }
         }
         val rawInput = buildString {
             append(eventClassName?.toString().orEmpty())
@@ -157,16 +157,33 @@ object SettingsSectionDetector {
         return visibleRows >= 3
     }
 
-    private fun collectText(node: AccessibilityNodeInfo, output: StringBuilder, depth: Int) {
-        if (depth > MAX_DEPTH) return
+    private fun collectText(
+        node: AccessibilityNodeInfo,
+        output: StringBuilder,
+        depth: Int,
+        budget: NodeBudget
+    ) {
+        if (depth > MAX_DEPTH || !budget.consume()) return
         nodeText(node).takeIf { it.isNotBlank() }?.let {
             output.append(it)
             output.append('\n')
         }
         for (index in 0 until node.childCount.coerceAtMost(MAX_CHILDREN)) {
             node.getChild(index)?.let { child ->
-                collectText(child, output, depth + 1)
+                collectText(child, output, depth + 1, budget)
             }
+            if (budget.exhausted) break
+        }
+    }
+
+    private class NodeBudget(private val maximum: Int) {
+        private var visited = 0
+        val exhausted: Boolean get() = visited >= maximum
+
+        fun consume(): Boolean {
+            if (exhausted) return false
+            visited += 1
+            return true
         }
     }
 
@@ -193,4 +210,5 @@ object SettingsSectionDetector {
 
     private const val MAX_DEPTH = 8
     private const val MAX_CHILDREN = 80
+    private const val MAX_NODES = 500
 }

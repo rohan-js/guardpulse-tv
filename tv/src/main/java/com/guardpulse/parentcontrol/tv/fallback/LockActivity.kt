@@ -33,6 +33,7 @@ import com.guardpulse.parentcontrol.shared.FirebasePaths
 import com.guardpulse.parentcontrol.shared.FirebaseServerClock
 import com.guardpulse.parentcontrol.shared.PinHasher
 import com.guardpulse.parentcontrol.shared.PolicyConstants
+import com.guardpulse.parentcontrol.tv.R
 import com.guardpulse.parentcontrol.tv.policy.LocalPolicyStore
 import com.guardpulse.parentcontrol.tv.sync.TamperEventQueue
 
@@ -207,7 +208,7 @@ class LockActivity : Activity() {
         }
 
         left.addView(TextView(this).apply {
-            text = "Access Locked"
+            text = getString(R.string.lock_access_title)
             textSize = 38f
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
@@ -215,7 +216,7 @@ class LockActivity : Activity() {
             isFocusable = false
         })
         left.addView(TextView(this).apply {
-            text = "Parent Lock"
+            text = getString(R.string.lock_parent_subtitle)
             textSize = 30f
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
@@ -260,7 +261,7 @@ class LockActivity : Activity() {
         pinDotsView = pinDots
         left.addView(pinDots)
 
-        left.addView(lockButton("Ask Parent to Unlock").apply {
+        left.addView(lockButton(getString(R.string.lock_ask_parent)).apply {
             setOnClickListener { createRemoteUnlockRequest() }
             backgroundTintList = ColorStateList.valueOf(guardNavy)
             setTextColor(Color.WHITE)
@@ -280,7 +281,7 @@ class LockActivity : Activity() {
         }
         left.addView(statusText)
         left.addView(TextView(this).apply {
-            text = "Use remote number keys to enter PIN. Back is disabled."
+            text = getString(R.string.lock_pin_instructions)
             textSize = 14f
             gravity = Gravity.CENTER
             setTextColor(mutedText)
@@ -396,14 +397,14 @@ class LockActivity : Activity() {
     private fun checkPin() {
         val retryMs = fallbackStore.pinRetryRemainingMs()
         if (retryMs > 0L) {
-            statusText?.text = "Try again in ${((retryMs + 999L) / 1_000L)} seconds"
+            statusText?.text = getString(R.string.lock_retry_wait, (retryMs + 999L) / 1_000L)
             pin = ""
             updatePinDisplay()
             return
         }
         val record = fallbackStore.loadPin()
         if (record == null) {
-            statusText?.text = "PIN is not configured. Use remote approval from the parent app."
+            statusText?.text = getString(R.string.lock_pin_missing)
             return
         }
         if (PinHasher.verify(
@@ -426,7 +427,7 @@ class LockActivity : Activity() {
             finishAndReturnToUnlockedTarget()
         } else {
             val retry = fallbackStore.recordFailedPinAttempt()
-            statusText?.text = "Incorrect PIN. Try again in ${retry.delayMs / 1_000L} seconds"
+            statusText?.text = getString(R.string.lock_pin_incorrect, retry.delayMs / 1_000L)
             if (retry.attempts >= PIN_TAMPER_THRESHOLD &&
                 fallbackStore.shouldReportTamper(PolicyConstants.TAMPER_PIN_RETRY_LOCKED)
             ) {
@@ -476,20 +477,20 @@ class LockActivity : Activity() {
 
     private fun createRemoteUnlockRequest() {
         if (requestId != null) {
-            statusText?.text = "Waiting for parent approval..."
+            statusText?.text = getString(R.string.lock_waiting_parent)
             return
         }
         val status = FirebaseBootstrap.initialize(this)
         if (!status.configured) {
-            statusText?.text = "Firebase is not configured."
+            statusText?.text = getString(R.string.lock_firebase_unavailable)
             return
         }
         val auth = FirebaseAuth.getInstance()
         if (auth.currentUser == null) {
-            statusText?.text = "Connecting to Firebase..."
+            statusText?.text = getString(R.string.lock_firebase_connecting)
             auth.signInAnonymously()
                 .addOnSuccessListener { writeRemoteUnlockRequest() }
-                .addOnFailureListener { statusText?.text = it.message ?: "Firebase sign-in failed" }
+                .addOnFailureListener { statusText?.text = getString(R.string.lock_firebase_sign_in_failed) }
             return
         }
         writeRemoteUnlockRequest()
@@ -503,7 +504,7 @@ class LockActivity : Activity() {
         val id = ref.key ?: return
         requestId = id
         unlockRequestRef = ref
-        statusText?.text = "Waiting for parent approval..."
+        statusText?.text = getString(R.string.lock_waiting_parent)
         ref.setValue(
             mapOf(
                 "requestId" to id,
@@ -516,10 +517,10 @@ class LockActivity : Activity() {
             )
         ).addOnSuccessListener {
             attachUnlockListener(ref)
-        }.addOnFailureListener { error ->
+        }.addOnFailureListener {
             requestId = null
             unlockRequestRef = null
-            statusText?.text = error.message ?: "Could not request remote unlock"
+            statusText?.text = getString(R.string.lock_request_failed)
         }
     }
 
@@ -538,7 +539,7 @@ class LockActivity : Activity() {
                             "updatedAt" to ServerValue.TIMESTAMP
                         )
                     )
-                    statusText?.text = "Unlock request expired"
+                    statusText?.text = getString(R.string.lock_request_expired)
                     return
                 }
                 when (status) {
@@ -554,13 +555,13 @@ class LockActivity : Activity() {
                         )
                         finishAndReturnToUnlockedTarget()
                     }
-                    PolicyConstants.UNLOCK_DENIED -> statusText?.text = "Parent denied unlock"
-                    PolicyConstants.UNLOCK_EXPIRED -> statusText?.text = "Unlock request expired"
+                    PolicyConstants.UNLOCK_DENIED -> statusText?.text = getString(R.string.lock_request_denied)
+                    PolicyConstants.UNLOCK_EXPIRED -> statusText?.text = getString(R.string.lock_request_expired)
                 }
             }
 
             override fun onCancelled(error: DatabaseError) {
-                statusText?.text = error.message
+                statusText?.text = getString(R.string.lock_request_failed)
             }
         }
         unlockRequestListener = listener
@@ -573,13 +574,13 @@ class LockActivity : Activity() {
 
     private fun lockReasonLabel(): String {
         return when (reason) {
-            PolicyConstants.BLOCK_REASON_DAILY_LIMIT -> "Daily Limit Reached"
-            PolicyConstants.BLOCK_REASON_RISKY_SETTINGS -> "Protected Settings"
-            PolicyConstants.BLOCK_REASON_SOURCE_LOCK -> "Live TV Locked"
+            PolicyConstants.BLOCK_REASON_DAILY_LIMIT -> getString(R.string.lock_title_daily_limit)
+            PolicyConstants.BLOCK_REASON_RISKY_SETTINGS -> getString(R.string.lock_title_protected_settings)
+            PolicyConstants.BLOCK_REASON_SOURCE_LOCK -> getString(R.string.lock_title_live_tv)
             PolicyConstants.BLOCK_REASON_SETTINGS_SECTION ->
                 "${settingsSectionLabel()} Locked"
-            PolicyConstants.TAMPER_ADMIN_DISABLE_REQUESTED -> "Admin Change Blocked"
-            else -> "App Is Blocked"
+            PolicyConstants.TAMPER_ADMIN_DISABLE_REQUESTED -> getString(R.string.lock_title_admin_change)
+            else -> getString(R.string.lock_title_app)
         }
     }
 
@@ -633,7 +634,7 @@ class LockActivity : Activity() {
 
     private fun lockedTargetLabel(): String {
         return if (isSettingsSectionGate()) {
-            "Settings: ${settingsSectionLabel()}"
+            getString(R.string.lock_settings_section, settingsSectionLabel())
         } else {
             packageNameToUnlock
         }
@@ -641,19 +642,19 @@ class LockActivity : Activity() {
 
     private fun lockReasonText(): String {
         val label = when (reason) {
-            PolicyConstants.BLOCK_REASON_DAILY_LIMIT -> "Daily limit reached"
-            PolicyConstants.BLOCK_REASON_RISKY_SETTINGS -> "Protected settings"
-            PolicyConstants.BLOCK_REASON_SOURCE_LOCK -> "Live TV source locked"
+            PolicyConstants.BLOCK_REASON_DAILY_LIMIT -> getString(R.string.lock_detail_daily_limit)
+            PolicyConstants.BLOCK_REASON_RISKY_SETTINGS -> getString(R.string.lock_detail_protected_settings)
+            PolicyConstants.BLOCK_REASON_SOURCE_LOCK -> getString(R.string.lock_detail_live_tv)
             PolicyConstants.BLOCK_REASON_SETTINGS_SECTION -> "${settingsSectionLabel()} locked"
-            PolicyConstants.TAMPER_ADMIN_DISABLE_REQUESTED -> "Admin change blocked"
-            else -> "App is blocked"
+            PolicyConstants.TAMPER_ADMIN_DISABLE_REQUESTED -> getString(R.string.lock_detail_admin_change)
+            else -> getString(R.string.lock_detail_app)
         }
         return "$label\n$packageNameToUnlock"
     }
 
     private fun settingsSectionLabel(): String {
         return PolicyConstants.settingsSectionPolicy(packageNameToUnlock)?.shortLabel
-            ?: "Settings section"
+            ?: getString(R.string.lock_settings_section_default)
     }
 
     private fun rounded(color: Int, radius: Int, strokeColor: Int? = null, strokeWidth: Int = 0): GradientDrawable {
