@@ -1,7 +1,9 @@
 package com.guardpulse.parentcontrol.tv.sync
 
 import android.content.Context
+import com.guardpulse.parentcontrol.shared.ControlSnapshotV2
 import org.json.JSONArray
+import org.json.JSONObject
 
 class TvSyncLocalStore(context: Context) {
     private val prefs = context.getSharedPreferences("tv_sync_runtime", Context.MODE_PRIVATE)
@@ -16,6 +18,14 @@ class TvSyncLocalStore(context: Context) {
     fun isV2Activated(): Boolean = prefs.getBoolean("v2Activated", false)
 
     fun lastV2Revision(): String? = prefs.getString("lastV2Revision", null)
+
+    fun saveValidV2Snapshot(snapshot: ControlSnapshotV2) {
+        prefs.edit()
+            .putString("lastValidV2Snapshot", JSONObject(snapshot.toFirebaseMap()).toString())
+            .apply()
+    }
+
+    fun lastValidV2SnapshotJson(): String? = prefs.getString("lastValidV2Snapshot", null)
 
     fun saveAppliedV2Revision(revisionId: String) {
         prefs.edit().putString("lastAppliedV2Revision", revisionId).apply()
@@ -40,6 +50,21 @@ class TvSyncLocalStore(context: Context) {
     fun lastFailedChannel(): String? = prefs.getString("lastFailedChannel", null)
     fun lastError(): String? = prefs.getString("lastError", null)
     fun lastErrorAt(): Long = prefs.getLong("lastErrorAt", 0L)
+
+    fun markChannelDirty(channel: String) {
+        val channels = dirtyChannels().toMutableSet()
+        channels += channel
+        prefs.edit().putStringSet("dirtyChannels", channels).apply()
+    }
+
+    fun markChannelClean(channel: String) {
+        val channels = dirtyChannels().toMutableSet()
+        channels -= channel
+        prefs.edit().putStringSet("dirtyChannels", channels).apply()
+    }
+
+    fun dirtyChannels(): Set<String> =
+        prefs.getStringSet("dirtyChannels", emptySet())?.toSet().orEmpty()
 
     fun isCommandProcessed(commandId: String): Boolean = commandId in processedCommands()
 

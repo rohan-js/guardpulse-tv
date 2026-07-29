@@ -18,6 +18,7 @@ import com.google.firebase.database.DatabaseError
 import com.google.firebase.database.DatabaseReference
 import com.google.firebase.database.FirebaseDatabase
 import com.google.firebase.database.MutableData
+import com.google.firebase.database.Query
 import com.google.firebase.database.ServerValue
 import com.google.firebase.database.Transaction
 import com.google.firebase.database.ValueEventListener
@@ -79,8 +80,8 @@ class TvSyncService : Service() {
     private var syncEngine: TvSyncEngine? = null
     private var firebaseConnected = false
     private var lastUsageWritePackage: String? = null
-    private val valueListeners = mutableListOf<Pair<DatabaseReference, ValueEventListener>>()
-    private val childListeners = mutableListOf<Pair<DatabaseReference, ChildEventListener>>()
+    private val valueListeners = mutableListOf<Pair<Query, ValueEventListener>>()
+    private val childListeners = mutableListOf<Pair<Query, ChildEventListener>>()
     private val retryFirebaseRunnable = Runnable {
         startedFirebase = false
         startFirebaseIfConfigured()
@@ -238,20 +239,21 @@ class TvSyncService : Service() {
         }
     }
 
-    private fun registerValueListener(ref: DatabaseReference, listener: ValueEventListener) {
-        ref.addValueEventListener(listener)
-        valueListeners += ref to listener
+    private fun registerValueListener(query: Query, listener: ValueEventListener) {
+        query.addValueEventListener(listener)
+        valueListeners += query to listener
     }
 
-    private fun registerChildListener(ref: DatabaseReference, listener: ChildEventListener) {
-        ref.addChildEventListener(listener)
-        childListeners += ref to listener
+    private fun registerChildListener(query: Query, listener: ChildEventListener) {
+        query.addChildEventListener(listener)
+        childListeners += query to listener
     }
 
     private fun recordSyncError(message: String?, channel: String = "firebase") {
         val redacted = redactError(message)
         lastSyncError = redacted
         syncLocalStore.saveLastError(channel, redacted)
+        syncLocalStore.markChannelDirty(channel)
         db?.child(FirebasePaths.deviceSecurityRuntime(deviceId))
             ?.updateChildren(
                 mapOf(
@@ -279,6 +281,11 @@ class TvSyncService : Service() {
     private fun clearSyncError() {
         lastSyncError = null
         syncLocalStore.saveLastError(null, null)
+    }
+
+    private fun markChannelSynced(channel: String) {
+        syncLocalStore.markChannelClean(channel)
+        if (syncLocalStore.dirtyChannels().isEmpty()) clearSyncError()
     }
 
     private fun onFirebaseReconnected(sessionId: String?) {
@@ -407,7 +414,11 @@ class TvSyncService : Service() {
     }
 
     private fun attachPairingListener() {
-        val ref = db?.child(FirebasePaths.pairRequests(deviceId)) ?: return
+        val ref = db?.child(FirebasePaths.pairRequests(deviceId))
+            ?.orderByChild("status")
+            ?.equalTo(PolicyConstants.PAIR_PENDING)
+            ?: return
+        cleanupPairRequests()
         registerChildListener(
             ref,
             object : ChildEventListener {
@@ -534,6 +545,24 @@ class TvSyncService : Service() {
                 }
             }
         )
+    }
+
+    private fun cleanupPairRequests() {
+        val path = FirebasePaths.pairRequests(deviceId)
+        db?.child(path)
+            ?.orderByChild("createdAt")
+            ?.endAt((serverClock.now() - PAIR_REQUEST_RETENTION_MS).toDouble())
+            ?.limitToFirst(100)
+            ?.addListenerForSingleValueEvent(object : ValueEventListener {
+                override fun onDataChange(snapshot: DataSnapshot) {
+                    snapshot.children.forEach { child ->
+                        val status = child.child("status").getValue(String::class.java)
+                        if (status in TERMINAL_PAIR_STATUSES) child.ref.removeValue()
+                    }
+                }
+
+                override fun onCancelled(error: DatabaseError) = Unit
+            })
     }
 
     private fun rejectPairRequest(
@@ -693,7 +722,10 @@ class TvSyncService : Service() {
     }
 
     private fun attachCommandListener() {
-        val ref = db?.child(FirebasePaths.deviceCommands(deviceId)) ?: return
+        val ref = db?.child(FirebasePaths.deviceCommands(deviceId))
+            ?.orderByChild("createdAt")
+            ?.limitToLast(20)
+            ?: return
         registerChildListener(
             ref,
             object : ChildEventListener {
@@ -843,6 +875,7 @@ class TvSyncService : Service() {
         )
         ref.updateChildren(updates)
             .addOnSuccessListener {
+                markChannelSynced("command")
                 if (result.isSuccess) syncLocalStore.markCommandProcessed(commandId)
                 db?.child(FirebasePaths.deviceSyncRuntime(deviceId))?.updateChildren(
                     mapOf("lastCommandWriteAt" to ServerValue.TIMESTAMP, "lastSuccessAt" to ServerValue.TIMESTAMP)
@@ -863,6 +896,7 @@ class TvSyncService : Service() {
         }
         root.child(FirebasePaths.deviceApps(deviceId)).setValue(payload)
             .addOnSuccessListener {
+                markChannelSynced("inventory")
                 root.child(FirebasePaths.deviceSyncRuntime(deviceId)).updateChildren(
                     mapOf(
                         "inventoryRevision" to java.util.UUID.randomUUID().toString(),
@@ -911,6 +945,7 @@ class TvSyncService : Service() {
         )
         db?.child(FirebasePaths.deviceHeartbeat(deviceId))?.updateChildren(heartbeat)
             ?.addOnSuccessListener {
+                markChannelSynced("heartbeat")
                 db?.child(FirebasePaths.deviceSyncRuntime(deviceId))?.updateChildren(
                     mapOf(
                         "connected" to firebaseConnected,
@@ -985,6 +1020,7 @@ class TvSyncService : Service() {
                 "updatedAt" to ServerValue.TIMESTAMP
             )
         )?.addOnSuccessListener {
+            markChannelSynced("health")
             db?.child(FirebasePaths.deviceSyncRuntime(deviceId))?.updateChildren(
                 mapOf("lastHealthWriteAt" to ServerValue.TIMESTAMP, "lastSuccessAt" to ServerValue.TIMESTAMP)
             )
@@ -1174,7 +1210,7 @@ class TvSyncService : Service() {
                     syncLocalStore.saveAppliedV2Revision(appliedRevision.revisionId)
                     syncLocalStore.savePendingAppliedRevision(null)
                 }
-                clearSyncError()
+                markChannelSynced("state")
                 onComplete?.invoke(Result.success(Unit))
             }
             .addOnFailureListener { error ->
@@ -1228,7 +1264,7 @@ class TvSyncService : Service() {
             }
         lastUsageWritePackage = packageName
         root.updateChildren(updates)
-            .addOnSuccessListener { clearSyncError() }
+            .addOnSuccessListener { markChannelSynced("usage") }
             .addOnFailureListener { error ->
                 recordSyncError(error.message ?: "Foreground usage upload failed", "usage")
             }
@@ -1309,6 +1345,13 @@ class TvSyncService : Service() {
         const val ACTION_FOREGROUND_CHANGED = "com.guardpulse.parentcontrol.tv.action.FOREGROUND_CHANGED"
         private const val CHANNEL_ID = "tv_parental_control"
         private const val NOTIFICATION_ID = 1001
+        private const val PAIR_REQUEST_RETENTION_MS = 7L * 24 * 60 * 60_000
+        private val TERMINAL_PAIR_STATUSES = setOf(
+            PolicyConstants.PAIR_ACCEPTED,
+            PolicyConstants.PAIR_REJECTED,
+            PolicyConstants.PAIR_EXPIRED,
+            PolicyConstants.PAIR_FAILED
+        )
     }
 
     private fun openSetup() {

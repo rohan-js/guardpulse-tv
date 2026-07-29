@@ -66,6 +66,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -89,6 +90,7 @@ import com.journeyapps.barcodescanner.ScanOptions
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlinx.coroutines.delay
 
 private data class ConfirmAction(
     val title: String,
@@ -177,6 +179,7 @@ class MainActivity : ComponentActivity() {
                                 syncViewModel.sendCommand(PolicyConstants.COMMAND_RESET_TODAY, packageName)
                             },
                             onReconnect = syncViewModel::reconnect,
+                            onRepairControl = syncViewModel::repairControlV2,
                             onScanQr = ::openExternalQrScanner
                         )
                     }
@@ -598,6 +601,7 @@ private fun ParentDashboard(
     onOpenTvSetup: () -> Unit,
     onResetToday: (String) -> Unit,
     onReconnect: () -> Unit,
+    onRepairControl: () -> Unit,
     onScanQr: () -> Unit
 ) {
     var tab by remember { mutableIntStateOf(0) }
@@ -704,7 +708,8 @@ private fun ParentDashboard(
                     onStopSafeMode,
                     confirm,
                     onOpenTvSetup,
-                    onReconnect
+                    onReconnect,
+                    onRepairControl
                 )
                 3 -> EventsTab(tamperEvents)
             }
@@ -1015,7 +1020,8 @@ private fun AppPolicyCard(
     onUpdatePolicy: (String, ParentPolicy) -> Unit,
     onResetToday: (String) -> Unit
 ) {
-    val usageMs = effectiveUsageMs(usageState, serverNow)
+    val usageNow by visibleUsageClock(serverNow)
+    val usageMs = effectiveUsageMs(usageState, usageNow)
     var limitText by remember(app.packageName, policy.dailyLimitMinutes) {
         mutableStateOf(policy.dailyLimitMinutes?.toString().orEmpty())
     }
@@ -1247,28 +1253,25 @@ private fun StatusLabel(label: String, color: Color, modifier: Modifier = Modifi
 }
 
 @Composable
-private fun SyncHealthCard(state: ParentSyncUiState, onReconnect: () -> Unit) {
+private fun SyncHealthCard(
+    state: ParentSyncUiState,
+    onReconnect: () -> Unit,
+    onRepairControl: () -> Unit
+) {
     val selectedDevice = state.devices.firstOrNull { it.deviceId == state.selectedDeviceId }
     val protocolReady = state.syncRuntime.protocolVersion >= PolicyConstants.SYNC_PROTOCOL_VERSION
     val tvConnected = if (protocolReady) state.syncRuntime.connected else selectedDevice?.online == true
     val freshness = ControlProtocol.freshness(tvConnected, selectedDevice?.lastSeen, state.serverNow)
     val desired = state.desiredRevision
     val applied = state.appliedRevision
-    val syncStatus = when {
-        !state.phoneConnected -> ParentSyncStatus.SENDING
-        state.controlV2Exists && !protocolReady -> ParentSyncStatus.TV_UPDATE_REQUIRED
-        desired?.revisionId != null && applied.revisionId == desired.revisionId &&
-            applied.status == PolicyConstants.SYNC_STATUS_FAILED -> ParentSyncStatus.FAILED
-        desired?.revisionId != null && applied.revisionId != desired.revisionId &&
-            freshness == DeviceFreshness.OFFLINE -> ParentSyncStatus.OFFLINE_PENDING
-        desired?.revisionId != null && applied.revisionId != desired.revisionId &&
-            freshness == DeviceFreshness.DELAYED -> ParentSyncStatus.DELAYED
-        desired?.revisionId != null && applied.revisionId != desired.revisionId -> ParentSyncStatus.WAITING_FOR_TV
-        desired?.revisionId != null && applied.revisionId == desired.revisionId -> ParentSyncStatus.APPLIED
-        freshness == DeviceFreshness.DELAYED -> ParentSyncStatus.DELAYED
-        freshness == DeviceFreshness.OFFLINE -> ParentSyncStatus.IDLE
-        else -> ParentSyncStatus.IDLE
-    }
+    val syncStatus = deriveSyncStatus(
+        phoneConnected = state.phoneConnected,
+        controlAvailability = state.controlAvailability,
+        protocolVersion = state.syncRuntime.protocolVersion,
+        desired = desired,
+        applied = applied,
+        freshness = freshness
+    )
     val statusText = if (!state.phoneConnected) {
         if (desired?.revisionId != null && applied.revisionId != desired.revisionId) {
             "Phone offline - writes queued"
@@ -1343,6 +1346,20 @@ private fun SyncHealthCard(state: ParentSyncUiState, onReconnect: () -> Unit) {
         }
         val error = applied.error ?: currentRuntimeError
         error?.let { Text(it, color = AlertRed, modifier = Modifier.padding(top = 10.dp)) }
+        if (state.controlAvailability == ControlAvailability.INVALID) {
+            Text(
+                state.controlError ?: "The synchronized control snapshot is malformed.",
+                color = AlertRed,
+                modifier = Modifier.padding(top = 10.dp)
+            )
+            OutlinedButton(
+                onClick = onRepairControl,
+                modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+                border = BorderStroke(1.dp, AlertRed)
+            ) {
+                Text("Repair synchronized control", color = AlertRed)
+            }
+        }
     }
 }
 
@@ -1370,7 +1387,8 @@ private fun SecurityTab(
     onStopSafeMode: () -> Unit,
     onConfirmAction: (String, String, String, Boolean, () -> Unit) -> Unit,
     onOpenTvSetup: () -> Unit,
-    onReconnect: () -> Unit
+    onReconnect: () -> Unit,
+    onRepairControl: () -> Unit
 ) {
     var pin by remember { mutableStateOf("") }
     var newModeName by remember { mutableStateOf("") }
@@ -1444,7 +1462,15 @@ private fun SecurityTab(
             }
         }
         item {
-            SyncHealthCard(syncState, onReconnect)
+            SyncHealthCard(syncState, onReconnect) {
+                onConfirmAction(
+                    "Repair synchronized control?",
+                    "This replaces the malformed V2 control with the last valid legacy-compatible policy.",
+                    "Repair",
+                    true,
+                    onRepairControl
+                )
+            }
         }
         item {
             GuardCard {
@@ -1775,6 +1801,7 @@ private fun ModeSummaryRow(
     onUpdateModePolicy: (String, String, ParentPolicy) -> Unit
 ) {
     var renameText by remember(mode.modeId, mode.name) { mutableStateOf(mode.name) }
+    val usageNow by visibleUsageClock(serverNow)
     val lockedCount = mode.appPolicies.values.count { it.manualBlocked }
     val limitCount = mode.appPolicies.values.count { it.dailyLimitMinutes != null }
     Column(
@@ -1836,7 +1863,7 @@ private fun ModeSummaryRow(
                         modeId = mode.modeId,
                         app = app,
                         policy = mode.appPolicies[app.packageName] ?: ParentPolicy(),
-                        usageMsToday = modeUsageMs(app.packageName, states, serverNow),
+                        usageMsToday = modeUsageMs(app.packageName, states, usageNow),
                         onUpdateModePolicy = onUpdateModePolicy
                     )
                 }
@@ -1934,12 +1961,13 @@ private fun ModeAppPolicyRow(
     }
 }
 
-private fun effectiveUsageMs(state: ParentState, serverNow: Long): Long {
-    if (!state.foregroundActive) return state.usageMsToday.coerceAtLeast(0L)
-    val capturedAt = state.usageCapturedAt ?: return state.usageMsToday.coerceAtLeast(0L)
-    val elapsed = (serverNow - capturedAt)
-        .coerceIn(0L, PolicyConstants.FOREGROUND_USAGE_EXTRAPOLATION_MAX_MS)
-    return (state.usageMsToday + elapsed).coerceAtLeast(0L)
+@Composable
+private fun visibleUsageClock(initialNow: Long) = produceState(initialValue = initialNow, key1 = initialNow) {
+    val serverOffset = initialNow - System.currentTimeMillis()
+    while (true) {
+        value = System.currentTimeMillis() + serverOffset
+        delay(1_000L)
+    }
 }
 
 private fun formatUsage(usageMs: Long): String {

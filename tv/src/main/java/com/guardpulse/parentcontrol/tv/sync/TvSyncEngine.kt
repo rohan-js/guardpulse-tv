@@ -105,6 +105,7 @@ class TvSyncEngine(
                     ControlProtocol.parse(event.snapshot)
                         .onSuccess { control ->
                             pendingSnapshot = control
+                            localStore.saveValidV2Snapshot(control)
                             localStore.activateV2(control.revisionId)
                             scheduleReconcile()
                         }

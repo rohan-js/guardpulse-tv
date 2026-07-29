@@ -152,6 +152,13 @@ enum class ParentSyncStatus {
     TV_UPDATE_REQUIRED
 }
 
+enum class ControlAvailability {
+    UNKNOWN,
+    MISSING,
+    VALID,
+    INVALID
+}
+
 data class ParentSyncUiState(
     val configured: Boolean = true,
     val firebaseMessage: String? = null,
@@ -179,6 +186,8 @@ data class ParentSyncUiState(
     val confirmedControl: ControlSnapshotV2? = null,
     val syncRuntime: SyncRuntimeState = SyncRuntimeState(),
     val controlV2Exists: Boolean = false,
+    val controlAvailability: ControlAvailability = ControlAvailability.UNKNOWN,
+    val controlError: String? = null,
     val loadingDevices: Boolean = false,
     val loadingDeviceDetails: Boolean = false,
     val message: String? = null

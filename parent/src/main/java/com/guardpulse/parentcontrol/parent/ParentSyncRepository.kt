@@ -33,7 +33,11 @@ class ParentSyncRepository(private val database: DatabaseReference) {
         fun onDesiredRevision(snapshot: DataSnapshot)
         fun onAppliedRevision(value: SyncAppliedRevision)
         fun onSyncRuntime(value: SyncRuntimeState)
-        fun onControlV2(exists: Boolean, value: ControlSnapshotV2?)
+        fun onControlV2(
+            availability: ControlAvailability,
+            value: ControlSnapshotV2?,
+            error: String? = null
+        )
         fun onError(message: String)
     }
 
@@ -52,6 +56,7 @@ class ParentSyncRepository(private val database: DatabaseReference) {
     private var currentObserver: DeviceObserver? = null
     private var retryDelayMs = INITIAL_RETRY_MS
     private val retryRunnable = Runnable(::reattach)
+    private val retentionCleaner = ParentRetentionCleaner(database)
 
     fun observeConnection(onConnected: (Boolean) -> Unit) {
         connectionRegistration?.remove()
@@ -158,6 +163,7 @@ class ParentSyncRepository(private val database: DatabaseReference) {
     private fun attachDeviceDetails() {
         val deviceId = currentDeviceId ?: return
         val observer = currentObserver ?: return
+        retentionCleaner.cleanup(deviceId)
 
         observe(FirebasePaths.deviceApps(deviceId), observer) { snapshot ->
             observer.onApps(snapshot.children.mapNotNull { child ->
@@ -241,7 +247,13 @@ class ParentSyncRepository(private val database: DatabaseReference) {
         observe(FirebasePaths.deviceSecurityRuntime(deviceId), observer) { snapshot ->
             observer.onSecurity(snapshot.securityRuntime())
         }
-        observe(FirebasePaths.deviceUnlockRequests(deviceId), observer) { snapshot ->
+        observe(
+            database.child(FirebasePaths.deviceUnlockRequests(deviceId))
+                .orderByChild("createdAt")
+                .limitToLast(30),
+            observer,
+            keepSynced = false
+        ) { snapshot ->
             observer.onUnlockRequests(snapshot.children.mapNotNull { child ->
                 UnlockRequest(
                     requestId = child.child("requestId").getValue(String::class.java)
@@ -260,7 +272,13 @@ class ParentSyncRepository(private val database: DatabaseReference) {
                 )
             }.sortedByDescending { it.createdAt ?: 0L })
         }
-        observe(FirebasePaths.deviceTamperEvents(deviceId), observer, keepSynced = false) { snapshot ->
+        observe(
+            database.child(FirebasePaths.deviceTamperEvents(deviceId))
+                .orderByChild("createdAt")
+                .limitToLast(50),
+            observer,
+            keepSynced = false
+        ) { snapshot ->
             observer.onTamperEvents(snapshot.children.mapNotNull { child ->
                 TamperEvent(
                     eventId = child.key ?: return@mapNotNull null,
@@ -268,9 +286,15 @@ class ParentSyncRepository(private val database: DatabaseReference) {
                     message = child.child("message").getValue(String::class.java),
                     createdAt = child.child("createdAt").getValue(Long::class.java)
                 )
-            }.sortedByDescending { it.createdAt ?: 0L }.take(30))
+            }.sortedByDescending { it.createdAt ?: 0L })
         }
-        observe(FirebasePaths.deviceCommands(deviceId), observer, keepSynced = false) { snapshot ->
+        observe(
+            database.child(FirebasePaths.deviceCommands(deviceId))
+                .orderByChild("createdAt")
+                .limitToLast(20),
+            observer,
+            keepSynced = false
+        ) { snapshot ->
             observer.onCommands(snapshot.children.mapNotNull { child ->
                 ParentCommand(
                     commandId = child.key ?: return@mapNotNull null,
@@ -283,7 +307,7 @@ class ParentSyncRepository(private val database: DatabaseReference) {
                     completedAt = child.child("completedAt").getValue(Long::class.java),
                     error = child.child("error").getValue(String::class.java)
                 )
-            }.sortedByDescending { it.createdAt ?: 0L }.take(20))
+            }.sortedByDescending { it.createdAt ?: 0L })
         }
         observe(FirebasePaths.deviceSyncDesired(deviceId), observer) { snapshot ->
             observer.onDesiredRevision(snapshot)
@@ -304,13 +328,16 @@ class ParentSyncRepository(private val database: DatabaseReference) {
         }
         observe(FirebasePaths.deviceControlV2(deviceId), observer) { snapshot ->
             if (!snapshot.exists()) {
-                observer.onControlV2(false, null)
+                observer.onControlV2(ControlAvailability.MISSING, null)
             } else {
                 ControlProtocol.parse(snapshot)
-                    .onSuccess { observer.onControlV2(true, it) }
+                    .onSuccess { observer.onControlV2(ControlAvailability.VALID, it) }
                     .onFailure { error ->
-                        observer.onControlV2(true, null)
-                        observer.onError(error.message ?: "Invalid synchronized TV control")
+                        observer.onControlV2(
+                            ControlAvailability.INVALID,
+                            null,
+                            error.message ?: "Invalid synchronized TV control"
+                        )
                     }
             }
         }
@@ -323,7 +350,16 @@ class ParentSyncRepository(private val database: DatabaseReference) {
         onData: (DataSnapshot) -> Unit
     ) {
         val ref = database.child(path)
-        detailRegistrations += register(ref, keepSynced, observer::onError) { snapshot ->
+        observe(ref, observer, keepSynced, onData)
+    }
+
+    private fun observe(
+        query: Query,
+        observer: DeviceObserver,
+        keepSynced: Boolean = true,
+        onData: (DataSnapshot) -> Unit
+    ) {
+        detailRegistrations += register(query, keepSynced, observer::onError) { snapshot ->
             retryDelayMs = INITIAL_RETRY_MS
             onData(snapshot)
         }

@@ -1,6 +1,0 @@
-<resources>
-    <string name="firebase_app_id">YOUR_PARENT_FIREBASE_APP_ID</string>
-    <string name="firebase_api_key">YOUR_FIREBASE_API_KEY</string>
-    <string name="firebase_project_id">your-firebase-project-id</string>
-    <string name="firebase_database_url">https://your-firebase-project-id-default-rtdb.firebaseio.com</string>
-</resources>

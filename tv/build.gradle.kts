@@ -1,7 +1,22 @@
+import java.io.FileInputStream
+import java.security.KeyStore
+import java.security.MessageDigest
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
+
+val firebaseProperties = Properties().apply {
+    rootProject.file("firebase.local.properties").takeIf { it.isFile }?.inputStream()?.use(::load)
+}
+val signingProperties = Properties().apply {
+    rootProject.file("signing.local.properties").takeIf { it.isFile }?.inputStream()?.use(::load)
+}
+val releaseRequested = gradle.startParameter.taskNames.any { it.contains("release", ignoreCase = true) }
+fun quoted(value: String) = "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
+fun firebaseValue(name: String, placeholder: String) = firebaseProperties.getProperty(name) ?: placeholder
 
 android {
     namespace = "com.guardpulse.parentcontrol.tv"
@@ -11,13 +26,58 @@ android {
         applicationId = "com.guardpulse.parentcontrol.tv"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = providers.gradleProperty("guardpulse.versionCode").orElse("2").get().toInt()
+        versionName = providers.gradleProperty("guardpulse.versionName").orElse("0.2.0").get()
+    }
+
+    signingConfigs {
+        create("privateRelease") {
+            if (signingProperties.isNotEmpty()) {
+                storeFile = file(signingProperties.getProperty("storeFile"))
+                storePassword = signingProperties.getProperty("storePassword")
+                keyAlias = signingProperties.getProperty("keyAlias")
+                keyPassword = signingProperties.getProperty("keyPassword")
+            }
+        }
     }
 
     buildTypes {
-        getByName("debug")
-        getByName("release")
+        getByName("debug") {
+            buildConfigField("String", "FIREBASE_APP_ID", quoted("YOUR_TV_FIREBASE_APP_ID"))
+            buildConfigField("String", "FIREBASE_API_KEY", quoted("YOUR_FIREBASE_API_KEY"))
+            buildConfigField("String", "FIREBASE_PROJECT_ID", quoted("your-firebase-project-id"))
+            buildConfigField(
+                "String",
+                "FIREBASE_DATABASE_URL",
+                quoted("https://your-firebase-project-id-default-rtdb.firebaseio.com")
+            )
+        }
+        getByName("release") {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.getByName("privateRelease")
+            buildConfigField(
+                "String",
+                "FIREBASE_APP_ID",
+                quoted(firebaseValue("tv.appId", "YOUR_TV_FIREBASE_APP_ID"))
+            )
+            buildConfigField(
+                "String",
+                "FIREBASE_API_KEY",
+                quoted(firebaseValue("firebase.apiKey", "YOUR_FIREBASE_API_KEY"))
+            )
+            buildConfigField(
+                "String",
+                "FIREBASE_PROJECT_ID",
+                quoted(firebaseValue("firebase.projectId", "your-firebase-project-id"))
+            )
+            buildConfigField(
+                "String",
+                "FIREBASE_DATABASE_URL",
+                quoted(firebaseValue("firebase.databaseUrl", "https://example.invalid"))
+            )
+        }
         create("ownerTest") {
             initWith(getByName("debug"))
             matchingFallbacks += listOf("debug")
@@ -33,6 +93,40 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    buildFeatures {
+        buildConfig = true
+    }
+}
+
+val verifyTvReleaseConfiguration = tasks.register("verifyTvReleaseConfiguration") {
+    doLast {
+        if (!releaseRequested) return@doLast
+        val requiredFirebase = listOf("firebase.apiKey", "firebase.projectId", "firebase.databaseUrl", "tv.appId")
+        require(requiredFirebase.all { !firebaseProperties.getProperty(it).isNullOrBlank() }) {
+            "Release Firebase values are missing from ignored firebase.local.properties"
+        }
+        val requiredSigning = listOf("storeFile", "storePassword", "keyAlias", "keyPassword", "expectedSha256")
+        require(requiredSigning.all { !signingProperties.getProperty(it).isNullOrBlank() }) {
+            "Release signing values are missing from ignored signing.local.properties"
+        }
+        val store = rootProject.file(signingProperties.getProperty("storeFile"))
+        val keyStore = KeyStore.getInstance(signingProperties.getProperty("storeType", "JKS"))
+        FileInputStream(store).use {
+            keyStore.load(it, signingProperties.getProperty("storePassword").toCharArray())
+        }
+        val certificate = keyStore.getCertificate(signingProperties.getProperty("keyAlias"))
+            ?: error("Release signing certificate was not found")
+        val actual = MessageDigest.getInstance("SHA-256")
+            .digest(certificate.encoded)
+            .joinToString("") { "%02x".format(it) }
+        require(actual.equals(signingProperties.getProperty("expectedSha256").replace(":", ""), true)) {
+            "Release signing certificate SHA-256 does not match the installed TV certificate"
+        }
+    }
+}
+tasks.matching { it.name == "preReleaseBuild" }.configureEach {
+    dependsOn(verifyTvReleaseConfiguration)
 }
 
 dependencies {

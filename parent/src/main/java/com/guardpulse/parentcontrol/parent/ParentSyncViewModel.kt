@@ -2,8 +2,6 @@ package com.guardpulse.parentcontrol.parent
 
 import android.app.Application
 import android.net.Uri
-import android.os.Handler
-import android.os.Looper
 import androidx.lifecycle.AndroidViewModel
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.database.FirebaseDatabase
@@ -17,10 +15,25 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
+private sealed interface ControlOperation {
+    data class UpdatePolicy(val packageName: String, val policy: ParentPolicy) : ControlOperation
+    data class SetPin(val pin: String) : ControlOperation
+    data class CreateMode(val name: String) : ControlOperation
+    data class RenameMode(val modeId: String, val name: String) : ControlOperation
+    data class DeleteMode(val modeId: String, val activeModeId: String?) : ControlOperation
+    data class UpdateModePolicy(
+        val modeId: String,
+        val packageName: String,
+        val policy: ParentPolicy
+    ) : ControlOperation
+    data class SetActiveMode(val mode: ParentMode?) : ControlOperation
+    data class StartSafeMode(val durationMinutes: Int) : ControlOperation
+    data object StopSafeMode : ControlOperation
+}
+
 class ParentSyncViewModel(application: Application) : AndroidViewModel(application) {
     private val auth = FirebaseAuth.getInstance()
     private val serverClock = FirebaseServerClock()
-    private val handler = Handler(Looper.getMainLooper())
     private val selectionPrefs = application.getSharedPreferences("parent_sync", 0)
     private val firebaseStatus = FirebaseRuntime.initialize(application)
     private val database = firebaseStatus.takeIf { it.configured }
@@ -52,7 +65,7 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
     private var migrationRequested = false
     private var pendingPairDeviceId: String? = selectionPrefs.getString("pendingPairDeviceId", null)
     private var pendingPairRequestId: String? = selectionPrefs.getString("pendingPairRequestId", null)
-    private val pendingControlActions = ArrayDeque<() -> Unit>()
+    private val pendingControlOperations = ArrayDeque<ControlOperation>()
 
     private val authListener = FirebaseAuth.AuthStateListener { firebaseAuth ->
         val signedIn = firebaseAuth.currentUser != null
@@ -66,13 +79,6 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
-    private val clockRunnable = object : Runnable {
-        override fun run() {
-            setState { it.copy(serverNow = serverClock.now()) }
-            handler.postDelayed(this, 1_000L)
-        }
-    }
-
     init {
         serverClock.start()
         auth.addAuthStateListener(authListener)
@@ -81,7 +87,6 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
             attachDeviceList()
             resumePairRequestObserver()
         }
-        handler.post(clockRunnable)
     }
 
     fun signIn(email: String, password: String) {
@@ -145,21 +150,19 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
 
     fun updatePolicy(packageName: String, policy: ParentPolicy) {
         val current = state.value
-        val deviceId = current.selectedDeviceId ?: return setMessage("Select a TV first")
+        current.selectedDeviceId ?: return setMessage("Select a TV first")
         val app = current.apps[packageName]
         if (app?.blockable == false) return setMessage("This app is protected: ${app.protectedReason ?: "not blockable"}")
         if (policy.dailyLimitMinutes != null && policy.dailyLimitMinutes !in 1..1440) {
             return setMessage("Daily limit must be between 1 and 1440 minutes")
         }
-        runWhenControlReady {
-            writer?.updatePolicy(deviceId, packageName, policy, ::controlSent, ::setMessage)
-        }
+        submitControlOperation(ControlOperation.UpdatePolicy(packageName, policy))
     }
 
     fun setPin(pin: String) {
-        val deviceId = state.value.selectedDeviceId ?: return setMessage("Select a TV before setting a PIN")
+        state.value.selectedDeviceId ?: return setMessage("Select a TV before setting a PIN")
         if (!pin.matches(Regex("\\d{6}"))) return setMessage("PIN must be 6 digits")
-        runWhenControlReady { writer?.setPin(deviceId, pin, ::controlSent, ::setMessage) }
+        submitControlOperation(ControlOperation.SetPin(pin))
     }
 
     fun updateUnlock(
@@ -203,59 +206,51 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun createMode(name: String) {
-        val deviceId = state.value.selectedDeviceId ?: return setMessage("Select a TV first")
+        state.value.selectedDeviceId ?: return setMessage("Select a TV first")
         val trimmed = name.trim()
         if (trimmed.isBlank()) return setMessage("Mode name cannot be empty")
-        runWhenControlReady { writer?.createMode(deviceId, trimmed, ::controlSent, ::setMessage) }
+        submitControlOperation(ControlOperation.CreateMode(trimmed))
     }
 
     fun renameMode(modeId: String, name: String) {
-        val deviceId = state.value.selectedDeviceId ?: return
+        state.value.selectedDeviceId ?: return
         val trimmed = name.trim()
         if (trimmed.isBlank()) return setMessage("Mode name cannot be empty")
-        runWhenControlReady {
-            writer?.updateModeName(deviceId, modeId, trimmed, ::controlSent, ::setMessage)
-        }
+        submitControlOperation(ControlOperation.RenameMode(modeId, trimmed))
     }
 
     fun deleteMode(modeId: String) {
         val current = state.value
-        val deviceId = current.selectedDeviceId ?: return
-        runWhenControlReady {
-            writer?.deleteMode(deviceId, modeId, current.activeMode.modeId, ::controlSent, ::setMessage)
-        }
+        current.selectedDeviceId ?: return
+        submitControlOperation(ControlOperation.DeleteMode(modeId, current.activeMode.modeId))
     }
 
     fun updateModePolicy(modeId: String, packageName: String, policy: ParentPolicy) {
         val current = state.value
-        val deviceId = current.selectedDeviceId ?: return setMessage("Select a TV first")
+        current.selectedDeviceId ?: return setMessage("Select a TV first")
         if (current.apps[packageName]?.blockable == false) {
             return setMessage("This app is protected: ${current.apps[packageName]?.protectedReason ?: "not blockable"}")
         }
         if (policy.dailyLimitMinutes != null && policy.dailyLimitMinutes !in 1..1440) {
             return setMessage("Daily limit must be between 1 and 1440 minutes")
         }
-        runWhenControlReady {
-            writer?.updateModePolicy(deviceId, modeId, packageName, policy, ::controlSent, ::setMessage)
-        }
+        submitControlOperation(ControlOperation.UpdateModePolicy(modeId, packageName, policy))
     }
 
     fun setActiveMode(mode: ParentMode?) {
-        val deviceId = state.value.selectedDeviceId ?: return setMessage("Select a TV first")
-        runWhenControlReady { writer?.setActiveMode(deviceId, mode, ::controlSent, ::setMessage) }
+        state.value.selectedDeviceId ?: return setMessage("Select a TV first")
+        submitControlOperation(ControlOperation.SetActiveMode(mode))
     }
 
     fun startSafeMode(durationMinutes: Int) {
-        val deviceId = state.value.selectedDeviceId ?: return setMessage("Select a TV first")
+        state.value.selectedDeviceId ?: return setMessage("Select a TV first")
         if (durationMinutes !in 1..1440) return setMessage("Safe Mode duration must be between 1 and 1440 minutes")
-        runWhenControlReady {
-            writer?.startSafeMode(deviceId, durationMinutes, ::controlSent, ::setMessage)
-        }
+        submitControlOperation(ControlOperation.StartSafeMode(durationMinutes))
     }
 
     fun stopSafeMode() {
-        val deviceId = state.value.selectedDeviceId ?: return setMessage("Select a TV first")
-        runWhenControlReady { writer?.stopSafeMode(deviceId, ::controlSent, ::setMessage) }
+        state.value.selectedDeviceId ?: return setMessage("Select a TV first")
+        submitControlOperation(ControlOperation.StopSafeMode)
     }
 
     fun sendCommand(type: String, packageName: String? = null) {
@@ -285,6 +280,29 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
                 setMessage(if (it.isSuccessful) "Reconnected" else it.exception?.message)
             }
             ?: syncRepository?.refresh()
+    }
+
+    fun repairControlV2() {
+        val current = state.value
+        if (current.controlAvailability != ControlAvailability.INVALID) {
+            return setMessage("Synchronized control does not require repair")
+        }
+        if (!legacyPoliciesLoaded || !legacyModesLoaded || !legacyActiveModeLoaded ||
+            !legacySafeModeLoaded || !legacyPinLoaded
+        ) {
+            return setMessage("Legacy TV controls are still loading; reconnect and try again")
+        }
+        val deviceId = current.selectedDeviceId ?: return setMessage("Select a TV first")
+        writer?.seedControlV2(
+            deviceId,
+            legacyPolicies,
+            legacyModes,
+            legacyActiveMode,
+            legacySafeMode,
+            legacyPin,
+            onSuccess = { setMessage("Repair sent; waiting for TV validation") },
+            onError = ::setMessage
+        )
     }
 
     private fun attachDeviceList() {
@@ -384,18 +402,34 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
             }
 
             override fun onSyncRuntime(value: com.guardpulse.parentcontrol.shared.SyncRuntimeState) {
-                setState { it.copy(syncRuntime = value) }
+                setState { it.copy(syncRuntime = value, serverNow = serverClock.now()) }
             }
 
-            override fun onControlV2(exists: Boolean, value: ControlSnapshotV2?) {
+            override fun onControlV2(
+                availability: ControlAvailability,
+                value: ControlSnapshotV2?,
+                error: String?
+            ) {
                 controlExistenceLoaded = true
-                setState { it.copy(controlV2Exists = exists, desiredControl = value) }
-                if (exists) {
-                    migrationRequested = true
-                    flushPendingControlActions()
-                    promoteConfirmedControl()
-                } else {
-                    maybeSeedControlV2()
+                setState {
+                    it.copy(
+                        controlV2Exists = availability != ControlAvailability.MISSING,
+                        controlAvailability = availability,
+                        controlError = error,
+                        desiredControl = value
+                    )
+                }
+                when (availability) {
+                    ControlAvailability.VALID -> {
+                        migrationRequested = true
+                        flushPendingControlOperations()
+                        promoteConfirmedControl()
+                    }
+                    ControlAvailability.MISSING -> maybeSeedControlV2()
+                    ControlAvailability.INVALID -> setMessage(
+                        "TV control is invalid. Mutations are disabled until it is repaired."
+                    )
+                    ControlAvailability.UNKNOWN -> Unit
                 }
             }
 
@@ -440,7 +474,7 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
         legacySafeMode = SafeModeState()
         latestRuntimeStates = emptyMap()
         migrationRequested = false
-        pendingControlActions.clear()
+        pendingControlOperations.clear()
         setState {
             it.copy(
                 selectedDeviceId = deviceId,
@@ -461,6 +495,8 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
                 confirmedControl = null,
                 syncRuntime = com.guardpulse.parentcontrol.shared.SyncRuntimeState(),
                 controlV2Exists = false,
+                controlAvailability = ControlAvailability.UNKNOWN,
+                controlError = null,
                 loadingDeviceDetails = true
             )
         }
@@ -468,7 +504,7 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
 
     private fun clearSelectedDevice() {
         selectionPrefs.edit().remove("selectedDeviceId").apply()
-        pendingControlActions.clear()
+        pendingControlOperations.clear()
         syncRepository?.clearSelectedDevice()
         setState {
             it.copy(
@@ -490,6 +526,8 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
                 confirmedControl = null,
                 syncRuntime = com.guardpulse.parentcontrol.shared.SyncRuntimeState(),
                 controlV2Exists = false,
+                controlAvailability = ControlAvailability.UNKNOWN,
+                controlError = null,
                 loadingDeviceDetails = false
             )
         }
@@ -611,25 +649,62 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
         setState { it.copy(confirmedStates = matching) }
     }
 
-    private fun matchingRuntimeStates(
-        revisionId: String,
-        runtimeStates: Map<String, ParentState>
-    ): Map<String, ParentState> = runtimeStates.filterValues { it.controlRevisionId == revisionId }
-
-    private fun runWhenControlReady(action: () -> Unit) {
-        if (state.value.controlV2Exists) {
-            action()
-            return
+    private fun submitControlOperation(operation: ControlOperation) {
+        when (state.value.controlAvailability) {
+            ControlAvailability.VALID -> executeControlOperation(operation)
+            ControlAvailability.INVALID -> {
+                setMessage("Control changes are disabled until synchronized control is repaired")
+            }
+            ControlAvailability.MISSING,
+            ControlAvailability.UNKNOWN -> {
+                pendingControlOperations.addLast(operation)
+                setMessage("Preparing synchronized TV controls; your change is queued")
+                maybeSeedControlV2()
+            }
         }
-        if (pendingControlActions.size >= 20) pendingControlActions.removeFirst()
-        pendingControlActions.addLast(action)
-        setMessage("Preparing synchronized TV controls; your change is queued")
-        maybeSeedControlV2()
     }
 
-    private fun flushPendingControlActions() {
-        while (pendingControlActions.isNotEmpty()) {
-            pendingControlActions.removeFirst().invoke()
+    private fun flushPendingControlOperations() {
+        while (pendingControlOperations.isNotEmpty()) {
+            executeControlOperation(pendingControlOperations.removeFirst())
+        }
+    }
+
+    private fun executeControlOperation(operation: ControlOperation) {
+        val deviceId = state.value.selectedDeviceId ?: return setMessage("Select a TV first")
+        val repository = writer ?: return setMessage("Firebase is unavailable")
+        when (operation) {
+            is ControlOperation.UpdatePolicy ->
+                repository.updatePolicy(deviceId, operation.packageName, operation.policy, ::controlSent, ::setMessage)
+            is ControlOperation.SetPin ->
+                repository.setPin(deviceId, operation.pin, ::controlSent, ::setMessage)
+            is ControlOperation.CreateMode ->
+                repository.createMode(deviceId, operation.name, ::controlSent, ::setMessage)
+            is ControlOperation.RenameMode ->
+                repository.updateModeName(deviceId, operation.modeId, operation.name, ::controlSent, ::setMessage)
+            is ControlOperation.DeleteMode ->
+                repository.deleteMode(
+                    deviceId,
+                    operation.modeId,
+                    operation.activeModeId,
+                    ::controlSent,
+                    ::setMessage
+                )
+            is ControlOperation.UpdateModePolicy ->
+                repository.updateModePolicy(
+                    deviceId,
+                    operation.modeId,
+                    operation.packageName,
+                    operation.policy,
+                    ::controlSent,
+                    ::setMessage
+                )
+            is ControlOperation.SetActiveMode ->
+                repository.setActiveMode(deviceId, operation.mode, ::controlSent, ::setMessage)
+            is ControlOperation.StartSafeMode ->
+                repository.startSafeMode(deviceId, operation.durationMinutes, ::controlSent, ::setMessage)
+            ControlOperation.StopSafeMode ->
+                repository.stopSafeMode(deviceId, ::controlSent, ::setMessage)
         }
     }
 
@@ -640,7 +715,6 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     override fun onCleared() {
-        handler.removeCallbacksAndMessages(null)
         auth.removeAuthStateListener(authListener)
         syncRepository?.close()
         serverClock.stop()

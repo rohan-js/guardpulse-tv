@@ -527,3 +527,56 @@ test("new PIN records require valid PBKDF2 parameters while legacy hashes remain
     })
   );
 });
+
+test("paired parent can delete terminal history but not pending work", async () => {
+  await testEnv.withSecurityRulesDisabled(async (context) => {
+    const db = context.database();
+    await db.ref("devices/tv1/commands/done").set({
+      type: "rescanApps",
+      status: "done",
+      createdAt: 1,
+    });
+    await db.ref("devices/tv1/commands/pending").set({
+      type: "rescanApps",
+      status: "pending",
+      createdAt: 2,
+    });
+    await db.ref("devices/tv1/unlockRequests/expired").set({
+      requestId: "expired",
+      packageName: "com.video",
+      reason: "manual",
+      status: "expired",
+      createdAt: 1,
+    });
+    await db.ref("devices/tv1/tamperEvents/event1").set({
+      type: "pinRetryLocked",
+      createdAt: 1,
+    });
+  });
+
+  await assertSucceeds(dbAs("parentUid").ref("devices/tv1/commands/done").remove());
+  await assertFails(dbAs("parentUid").ref("devices/tv1/commands/pending").remove());
+  await assertSucceeds(dbAs("parentUid").ref("devices/tv1/unlockRequests/expired").remove());
+  await assertSucceeds(dbAs("parentUid").ref("devices/tv1/tamperEvents/event1").remove());
+});
+
+test("request identity fields are immutable after creation", async () => {
+  await testEnv.withSecurityRulesDisabled(async (context) => {
+    await context.database().ref("devices/tv1/unlockRequests/requestImmutable").set({
+      requestId: "requestImmutable",
+      packageName: "com.video",
+      reason: "manual",
+      status: "pending",
+      createdAt: 1,
+      expiresAt: 600001,
+    });
+  });
+  await assertFails(
+    dbAs("parentUid").ref("devices/tv1/unlockRequests/requestImmutable").update({
+      packageName: "com.other",
+      status: "approved",
+      updatedAt: 2,
+      updatedBy: "parentUid",
+    })
+  );
+});

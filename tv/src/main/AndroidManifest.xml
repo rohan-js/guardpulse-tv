@@ -57,7 +57,10 @@
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:supportsRtl="true"
-        android:theme="@style/AppTheme">
+        android:theme="@style/AppTheme"
+        tools:ignore="MissingLeanbackLauncher">
+
+        <!-- Intentionally no launcher entry: setup is opened remotely and PIN-gated. -->
 
         <activity
             android:name=".MainActivity"

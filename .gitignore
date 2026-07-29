@@ -2,6 +2,8 @@
 build/
 */build/
 local.properties
+firebase.local.properties
+signing.local.properties
 captures/
 .idea/
 *.iml

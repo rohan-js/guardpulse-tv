@@ -10,44 +10,50 @@ data class FirebaseStatus(
     val message: String
 )
 
+data class FirebaseConfiguration(
+    val appId: String,
+    val apiKey: String,
+    val projectId: String,
+    val databaseUrl: String
+)
+
 object FirebaseBootstrap {
     fun initialize(context: Context): FirebaseStatus {
         if (FirebaseApp.getApps(context).isNotEmpty()) {
             return FirebaseStatus(configured = true, message = "Firebase initialized")
         }
+        return FirebaseStatus(
+            configured = false,
+            message = "Firebase must be configured by the application"
+        )
+    }
 
-        val appId = readString(context, "firebase_app_id")
-        val apiKey = readString(context, "firebase_api_key")
-        val projectId = readString(context, "firebase_project_id")
-        val databaseUrl = readString(context, "firebase_database_url")
-
+    fun initialize(context: Context, configuration: FirebaseConfiguration): FirebaseStatus {
+        if (FirebaseApp.getApps(context).isNotEmpty()) {
+            return FirebaseStatus(configured = true, message = "Firebase initialized")
+        }
         val missing = listOf(
-            "firebase_app_id" to appId,
-            "firebase_api_key" to apiKey,
-            "firebase_project_id" to projectId,
-            "firebase_database_url" to databaseUrl
+            "appId" to configuration.appId,
+            "apiKey" to configuration.apiKey,
+            "projectId" to configuration.projectId,
+            "databaseUrl" to configuration.databaseUrl
         ).filter { (_, value) -> isPlaceholder(value) }
 
         if (missing.isNotEmpty()) {
             return FirebaseStatus(
                 configured = false,
-                message = "Replace Firebase values in res/values/firebase_config.xml"
+                message = "Firebase configuration is not available in this build"
             )
         }
 
         val options = FirebaseOptions.Builder()
-            .setApplicationId(appId)
-            .setApiKey(apiKey)
-            .setProjectId(projectId)
-            .setDatabaseUrl(databaseUrl)
+            .setApplicationId(configuration.appId)
+            .setApiKey(configuration.apiKey)
+            .setProjectId(configuration.projectId)
+            .setDatabaseUrl(configuration.databaseUrl)
             .build()
         FirebaseApp.initializeApp(context, options)
         return FirebaseStatus(configured = true, message = "Firebase initialized")
-    }
-
-    private fun readString(context: Context, name: String): String {
-        val id = context.resources.getIdentifier(name, "string", context.packageName)
-        return if (id == 0) "" else context.getString(id).trim()
     }
 
     private fun isPlaceholder(value: String): Boolean {
@@ -67,6 +73,16 @@ object FirebaseRuntime {
     @Synchronized
     fun initialize(context: Context): FirebaseStatus {
         val status = FirebaseBootstrap.initialize(context)
+        return enablePersistence(status)
+    }
+
+    @Synchronized
+    fun initialize(context: Context, configuration: FirebaseConfiguration): FirebaseStatus {
+        val status = FirebaseBootstrap.initialize(context, configuration)
+        return enablePersistence(status)
+    }
+
+    private fun enablePersistence(status: FirebaseStatus): FirebaseStatus {
         if (!status.configured || persistenceAttempted) return status
         persistenceAttempted = true
         runCatching {
