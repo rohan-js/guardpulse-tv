@@ -420,8 +420,10 @@ class ParentSyncRepository(private val database: DatabaseReference) {
     }
 
     private fun DataSnapshot.packageName(): String? {
-        return child("packageName").getValue(String::class.java)
-            ?: runCatching { PackageKeys.decode(key.orEmpty()) }.getOrNull()
+        return normalizedPackageName(
+            encodedKey = key,
+            storedPackageName = child("packageName").getValue(String::class.java)
+        )
     }
 
     private fun DataSnapshot.parentPolicy(): ParentPolicy {
@@ -510,4 +512,15 @@ class ParentSyncRepository(private val database: DatabaseReference) {
         private const val INITIAL_RETRY_MS = 5_000L
         private const val MAX_RETRY_MS = 5 * 60_000L
     }
+}
+internal fun normalizedPackageName(encodedKey: String?, storedPackageName: String?): String? {
+    val key = encodedKey?.takeIf { it.isNotBlank() }
+    val decoded = key?.let { runCatching { PackageKeys.decode(it) }.getOrNull() }
+    val stored = storedPackageName?.takeIf { it.isNotBlank() }
+    if (stored != null && key != null &&
+        runCatching { PackageKeys.encode(stored) }.getOrNull() == key
+    ) {
+        return stored
+    }
+    return decoded ?: stored
 }

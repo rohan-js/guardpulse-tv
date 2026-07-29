@@ -24,3 +24,15 @@ internal fun appendProcessedCommand(
     updated += commandId
     return updated.takeLast(maximum)
 }
+
+internal fun shouldApplyControl(
+    controlRevisionId: String,
+    lastAppliedRevisionId: String?,
+    pendingAppliedRevisionId: String?,
+    currentSessionId: String?,
+    lastAppliedSessionId: String?
+): Boolean {
+    return currentSessionId != lastAppliedSessionId ||
+        pendingAppliedRevisionId != null ||
+        lastAppliedRevisionId != controlRevisionId
+}

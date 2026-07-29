@@ -48,7 +48,9 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent {
-            val state by syncViewModel.state.collectAsStateWithLifecycle()
+            val state by syncViewModel.state.collectAsStateWithLifecycle(
+                lifecycleOwner = this@MainActivity
+            )
             ParentTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     if (!state.configured) {

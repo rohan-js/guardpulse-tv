@@ -33,11 +33,15 @@ class TvSyncLocalStore(context: Context) {
     fun lastValidV2SnapshotJson(): String? =
         secureStore.migratePlaintext("lastValidV2Snapshot")
 
-    fun saveAppliedV2Revision(revisionId: String) {
-        prefs.edit().putString("lastAppliedV2Revision", revisionId).apply()
+    fun saveAppliedV2Revision(revisionId: String, sessionId: String?) {
+        prefs.edit()
+            .putString("lastAppliedV2Revision", revisionId)
+            .putString("lastAppliedSessionId", sessionId)
+            .apply()
     }
 
     fun lastAppliedV2Revision(): String? = prefs.getString("lastAppliedV2Revision", null)
+    fun lastAppliedSessionId(): String? = prefs.getString("lastAppliedSessionId", null)
 
     fun savePendingAppliedRevision(revisionId: String?) {
         prefs.edit().putString("pendingAppliedRevision", revisionId).apply()

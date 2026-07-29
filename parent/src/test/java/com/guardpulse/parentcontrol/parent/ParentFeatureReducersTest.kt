@@ -81,4 +81,22 @@ class ParentFeatureReducersTest {
         }
         assertEquals("com.video", values["Y29tLnZpZGVv"]?.get("packageName"))
     }
+
+    @Test
+    fun legacyDoubleEncodedPackageNameUsesThePathKeyAsAuthority() {
+        assertEquals(
+            "com.video",
+            normalizedPackageName(
+                encodedKey = "Y29tLnZpZGVv",
+                storedPackageName = "Y29tLnZpZGVv"
+            )
+        )
+        assertEquals(
+            "com.video",
+            normalizedPackageName(
+                encodedKey = "Y29tLnZpZGVv",
+                storedPackageName = "com.video"
+            )
+        )
+    }
 }

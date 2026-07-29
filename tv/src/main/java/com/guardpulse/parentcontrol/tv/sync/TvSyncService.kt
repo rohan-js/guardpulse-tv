@@ -48,6 +48,7 @@ import com.guardpulse.parentcontrol.tv.system.BackgroundRestrictionStatus
 import com.guardpulse.parentcontrol.tv.usage.UsageTracker
 import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.tasks.await
 
 private data class ModePolicy(
     val modeId: String,
@@ -187,9 +188,12 @@ class TvSyncService : Service() {
             deviceId = deviceId,
             localStore = syncLocalStore,
             callback = object : TvSyncEngine.Callback {
-                override suspend fun onConnectionChanged(connected: Boolean, sessionId: String?) {
+                override suspend fun onConnectionChanged(
+                    connected: Boolean,
+                    sessionId: String?
+                ): Boolean {
                     firebaseConnected = connected
-                    if (connected) onFirebaseReconnected(sessionId)
+                    return !connected || onFirebaseReconnected(sessionId)
                 }
 
                 override suspend fun onControlReady(
@@ -377,8 +381,8 @@ class TvSyncService : Service() {
         if (syncLocalStore.dirtyChannels().isEmpty()) clearSyncError()
     }
 
-    private suspend fun onFirebaseReconnected(sessionId: String?) {
-        val root = db ?: return
+    private suspend fun onFirebaseReconnected(sessionId: String?): Boolean {
+        val root = db ?: return false
         fallbackStore.saveServerTimeOffset(serverClock.offsetMillis())
         FirebaseAuth.getInstance().currentUser?.uid?.let(::registerDevice)
         val runtimeRef = root.child(FirebasePaths.deviceSyncRuntime(deviceId))
@@ -388,15 +392,21 @@ class TvSyncService : Service() {
                 "disconnectedAt" to ServerValue.TIMESTAMP
             )
         )
-        runtimeRef.updateChildren(
-            mapOf(
-                "connected" to true,
-                "sessionId" to sessionId,
-                "protocolVersion" to PolicyConstants.SYNC_PROTOCOL_VERSION,
-                "connectedAt" to ServerValue.TIMESTAMP,
-                "lastSuccessAt" to ServerValue.TIMESTAMP
+        try {
+            runtimeRef.updateChildren(
+                mapOf(
+                    "connected" to true,
+                    "sessionId" to sessionId,
+                    "protocolVersion" to PolicyConstants.SYNC_PROTOCOL_VERSION,
+                    "connectedAt" to ServerValue.TIMESTAMP,
+                    "lastSuccessAt" to ServerValue.TIMESTAMP
+                )
             )
-        )
+                .await()
+        } catch (error: Exception) {
+            recordSyncError(error.message ?: "Runtime session upload failed", "connection")
+            return false
+        }
         pairingManager.pairedParentUid()?.let { parentUid ->
             root.child(FirebasePaths.userDevice(parentUid, deviceId))
                 .onDisconnect()
@@ -408,6 +418,7 @@ class TvSyncService : Service() {
         updateHeartbeat()
         awaitInventoryUpload()
         TamperEventQueue.flush(this)
+        return true
     }
 
     private suspend fun applyV2Control(
@@ -1274,23 +1285,27 @@ class TvSyncService : Service() {
         updates["${FirebasePaths.deviceSyncRuntime(deviceId)}/lastFailedChannel"] = null
         updates["${FirebasePaths.deviceSyncRuntime(deviceId)}/lastError"] = null
         updates["${FirebasePaths.deviceSyncRuntime(deviceId)}/lastErrorAt"] = null
-        if (appliedRevision != null &&
-            (applyGeneration == 0L || syncEngine?.isCurrent(applyGeneration, appliedRevision.revisionId) == true)
-        ) {
+        val appliedSessionId = syncEngine?.currentSessionId()
+        val shouldAcknowledge = appliedRevision != null &&
+            !appliedSessionId.isNullOrBlank() &&
+            (applyGeneration == 0L ||
+                syncEngine?.isCurrent(applyGeneration, appliedRevision.revisionId) == true)
+        if (shouldAcknowledge && appliedRevision != null) {
             updates[FirebasePaths.deviceSyncApplied(deviceId)] = mapOf(
                 "revisionId" to appliedRevision.revisionId,
                 "status" to PolicyConstants.SYNC_STATUS_APPLIED,
                 "appliedAt" to ServerValue.TIMESTAMP,
-                "sessionId" to syncEngine?.currentSessionId()
+                "sessionId" to appliedSessionId
             )
             updates["${FirebasePaths.deviceSyncRuntime(deviceId)}/lastPolicyAppliedAt"] = ServerValue.TIMESTAMP
         }
         root.updateChildren(updates)
             .addOnSuccessListener {
-                if (appliedRevision != null &&
-                    (applyGeneration == 0L || syncEngine?.isCurrent(applyGeneration, appliedRevision.revisionId) == true)
-                ) {
-                    syncLocalStore.saveAppliedV2Revision(appliedRevision.revisionId)
+                if (shouldAcknowledge && appliedRevision != null) {
+                    syncLocalStore.saveAppliedV2Revision(
+                        appliedRevision.revisionId,
+                        appliedSessionId
+                    )
                     syncLocalStore.savePendingAppliedRevision(null)
                 }
                 markChannelSynced("state")

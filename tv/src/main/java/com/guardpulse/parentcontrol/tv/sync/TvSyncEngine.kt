@@ -25,7 +25,7 @@ class TvSyncEngine(
     private val callback: Callback
 ) {
     interface Callback {
-        suspend fun onConnectionChanged(connected: Boolean, sessionId: String?)
+        suspend fun onConnectionChanged(connected: Boolean, sessionId: String?): Boolean
         suspend fun onControlReady(
             snapshot: ControlSnapshotV2,
             desired: SyncDesiredRevision?,
@@ -110,7 +110,10 @@ class TvSyncEngine(
                     retryDelayMs = INITIAL_RETRY_MS
                     sessionId = UUID.randomUUID().toString()
                 }
-                callback.onConnectionChanged(event.connected, sessionId)
+                val connectionReady = callback.onConnectionChanged(event.connected, sessionId)
+                if (event.connected) {
+                    if (connectionReady) scheduleReconcile() else scheduleRetry()
+                }
             }
             is TvSyncEvent.Control -> {
                 if (!event.snapshot.exists()) {
@@ -203,8 +206,13 @@ class TvSyncEngine(
     private suspend fun dispatchNewestControl() {
         val control = pendingSnapshot ?: return
         val desired = pendingDesired
-        if (localStore.lastAppliedV2Revision() == control.revisionId &&
-            localStore.pendingAppliedRevision() == null
+        if (!shouldApplyControl(
+                controlRevisionId = control.revisionId,
+                lastAppliedRevisionId = localStore.lastAppliedV2Revision(),
+                pendingAppliedRevisionId = localStore.pendingAppliedRevision(),
+                currentSessionId = sessionId,
+                lastAppliedSessionId = localStore.lastAppliedSessionId()
+            )
         ) {
             return
         }
@@ -218,6 +226,18 @@ class TvSyncEngine(
         }
         val generation = revisionTracker.advance(control.revisionId)
         callback.onControlReady(control, desired, generation)
+        if (localStore.lastAppliedV2Revision() == control.revisionId &&
+            localStore.lastAppliedSessionId() == sessionId &&
+            localStore.pendingAppliedRevision() == null
+        ) {
+            return
+        } else {
+            reconcileJob?.cancel()
+            reconcileJob = scope.launch {
+                delay(INITIAL_RETRY_MS)
+                events.send(TvSyncEvent.Reconcile)
+            }
+        }
     }
 
     private fun scheduleRetry() {

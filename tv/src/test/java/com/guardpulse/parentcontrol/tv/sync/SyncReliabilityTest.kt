@@ -30,4 +30,26 @@ class SyncReliabilityTest {
             appendProcessedCommand(result, "four", 3)
         )
     }
+
+    @Test
+    fun unchangedRevisionIsReappliedForANewSessionAcknowledgement() {
+        assertFalse(
+            shouldApplyControl(
+                controlRevisionId = "revision-1",
+                lastAppliedRevisionId = "revision-1",
+                pendingAppliedRevisionId = null,
+                currentSessionId = "session-1",
+                lastAppliedSessionId = "session-1"
+            )
+        )
+        assertTrue(
+            shouldApplyControl(
+                controlRevisionId = "revision-1",
+                lastAppliedRevisionId = "revision-1",
+                pendingAppliedRevisionId = null,
+                currentSessionId = "session-2",
+                lastAppliedSessionId = "session-1"
+            )
+        )
+    }
 }
