@@ -45,6 +45,8 @@ import com.guardpulse.parentcontrol.tv.policy.DevicePolicyController
 import com.guardpulse.parentcontrol.tv.policy.LocalPolicyStore
 import com.guardpulse.parentcontrol.tv.system.BackgroundRestrictionStatus
 import com.guardpulse.parentcontrol.tv.usage.UsageTracker
+import kotlin.coroutines.resume
+import kotlinx.coroutines.suspendCancellableCoroutine
 
 private data class ModePolicy(
     val modeId: String,
@@ -180,12 +182,12 @@ class TvSyncService : Service() {
             deviceId = deviceId,
             localStore = syncLocalStore,
             callback = object : TvSyncEngine.Callback {
-                override fun onConnectionChanged(connected: Boolean, sessionId: String?) {
+                override suspend fun onConnectionChanged(connected: Boolean, sessionId: String?) {
                     firebaseConnected = connected
                     if (connected) onFirebaseReconnected(sessionId)
                 }
 
-                override fun onControlReady(
+                override suspend fun onControlReady(
                     snapshot: ControlSnapshotV2,
                     desired: SyncDesiredRevision?,
                     generation: Long
@@ -193,12 +195,12 @@ class TvSyncService : Service() {
                     applyV2Control(snapshot, desired, generation)
                 }
 
-                override fun onControlRejected(revisionId: String?, error: String) {
+                override suspend fun onControlRejected(revisionId: String?, error: String) {
                     recordSyncError("V2 control rejected: $error", "control")
                     writeFailedRevision(revisionId, error)
                 }
 
-                override fun onSyncListenerError(channel: String, error: DatabaseError) {
+                override suspend fun onSyncListenerError(channel: String, error: DatabaseError) {
                     recordSyncError("$channel listener cancelled: ${error.message}", channel)
                 }
             }
@@ -221,6 +223,19 @@ class TvSyncService : Service() {
         attachSafeModeListener()
         attachSecurityListener()
         attachCommandListener()
+    }
+
+    private fun scheduleListenerRecovery() {
+        handler.post {
+            valueListeners.forEach { (ref, listener) -> ref.removeEventListener(listener) }
+            childListeners.forEach { (ref, listener) -> ref.removeEventListener(listener) }
+            valueListeners.clear()
+            childListeners.clear()
+            listenersAttached = false
+            handler.removeCallbacks(retryFirebaseRunnable)
+            handler.postDelayed({ attachFirebaseListeners() }, authRetryDelayMs)
+            authRetryDelayMs = (authRetryDelayMs * 2).coerceAtMost(5 * 60_000L)
+        }
     }
 
     private fun registerValueListener(ref: DatabaseReference, listener: ValueEventListener) {
@@ -298,7 +313,7 @@ class TvSyncService : Service() {
         TamperEventQueue.flush(this)
     }
 
-    private fun applyV2Control(
+    private suspend fun applyV2Control(
         snapshot: ControlSnapshotV2,
         desired: SyncDesiredRevision?,
         generation: Long
@@ -333,13 +348,17 @@ class TvSyncService : Service() {
         db?.child(FirebasePaths.deviceSyncRuntime(deviceId))?.updateChildren(
             mapOf("lastPolicyReceivedAt" to ServerValue.TIMESTAMP)
         )
-        applyPoliciesAndUpload(
-            appliedRevision = desired ?: SyncDesiredRevision(
-                revisionId = snapshot.revisionId,
-                kind = PolicyConstants.REVISION_MIGRATION
-            ),
-            applyGeneration = generation
-        )
+        suspendCancellableCoroutine { continuation ->
+            applyPoliciesAndUpload(
+                appliedRevision = desired ?: SyncDesiredRevision(
+                    revisionId = snapshot.revisionId,
+                    kind = PolicyConstants.REVISION_MIGRATION
+                ),
+                applyGeneration = generation
+            ) {
+                if (continuation.isActive) continuation.resume(Unit)
+            }
+        }
     }
 
     private fun writeFailedRevision(revisionId: String?, error: String) {
@@ -430,6 +449,7 @@ class TvSyncService : Service() {
                 override fun onChildMoved(snapshot: DataSnapshot, previousChildName: String?) = Unit
                 override fun onCancelled(error: DatabaseError) {
                     recordSyncError("Pairing listener cancelled: ${error.message}")
+                    scheduleListenerRecovery()
                 }
             }
         )
@@ -477,6 +497,7 @@ class TvSyncService : Service() {
 
                 override fun onCancelled(error: DatabaseError) {
                     recordSyncError("Policy listener cancelled: ${error.message}")
+                    scheduleListenerRecovery()
                 }
             }
         )
@@ -515,6 +536,7 @@ class TvSyncService : Service() {
 
                 override fun onCancelled(error: DatabaseError) {
                     recordSyncError("Modes listener cancelled: ${error.message}")
+                    scheduleListenerRecovery()
                 }
             }
         )
@@ -538,6 +560,7 @@ class TvSyncService : Service() {
 
                 override fun onCancelled(error: DatabaseError) {
                     recordSyncError("Active mode listener cancelled: ${error.message}")
+                    scheduleListenerRecovery()
                 }
             }
         )
@@ -561,6 +584,7 @@ class TvSyncService : Service() {
 
                 override fun onCancelled(error: DatabaseError) {
                     recordSyncError("Safe Mode listener cancelled: ${error.message}")
+                    scheduleListenerRecovery()
                 }
             }
         )
@@ -591,6 +615,7 @@ class TvSyncService : Service() {
 
                 override fun onCancelled(error: DatabaseError) {
                     recordSyncError("Security listener cancelled: ${error.message}")
+                    scheduleListenerRecovery()
                 }
             }
         )
@@ -612,6 +637,7 @@ class TvSyncService : Service() {
                 override fun onChildMoved(snapshot: DataSnapshot, previousChildName: String?) = Unit
                 override fun onCancelled(error: DatabaseError) {
                     recordSyncError("Command listener cancelled: ${error.message}")
+                    scheduleListenerRecovery()
                 }
             }
         )
