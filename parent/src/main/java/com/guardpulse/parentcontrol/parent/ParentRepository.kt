@@ -81,7 +81,14 @@ class ParentRepository(
                     "startedBy" to safeMode.startedBy
                 ),
                 "pin" to pin?.let {
-                    mapOf("salt" to it.salt, "hash" to it.hash, "updatedAt" to it.updatedAt)
+                    mapOf(
+                        "salt" to it.salt,
+                        "hash" to it.hash,
+                        "version" to it.version,
+                        "algorithm" to it.algorithm,
+                        "iterations" to it.iterations,
+                        "updatedAt" to it.updatedAt
+                    )
                 }
             )
             val updates = mutableMapOf<String, Any?>(FirebasePaths.deviceControlV2(deviceId) to control)
@@ -114,6 +121,9 @@ class ParentRepository(
         val value = mapOf(
             "salt" to hash.salt,
             "hash" to hash.hash,
+            "version" to hash.version,
+            "algorithm" to hash.algorithm,
+            "iterations" to hash.iterations,
             "updatedAt" to ServerValue.TIMESTAMP,
             "updatedBy" to auth.currentUser?.uid
         )
@@ -348,6 +358,7 @@ class ParentRepository(
     }
 
     private fun appPolicyValue(packageName: String, policy: ParentPolicy): Map<String, Any?> = mapOf(
+        "packageKey" to PackageKeys.encode(packageName),
         "packageName" to packageName,
         "manualBlocked" to policy.manualBlocked,
         "dailyLimitMinutes" to policy.dailyLimitMinutes,

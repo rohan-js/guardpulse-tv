@@ -71,6 +71,7 @@ object PolicyConstants {
     const val TAMPER_USAGE_ACCESS_MISSING = "usageAccessMissing"
     const val TAMPER_VPN_DISABLED = "vpnDisabled"
     const val TAMPER_RISKY_SETTINGS_OPENED = "riskySettingsOpened"
+    const val TAMPER_PIN_RETRY_LOCKED = "pinRetryLocked"
 
     const val HEARTBEAT_INTERVAL_MS = 30_000L
     const val USAGE_SCAN_INTERVAL_MS = 60_000L

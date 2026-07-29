@@ -249,12 +249,13 @@ class TvSyncService : Service() {
     }
 
     private fun recordSyncError(message: String?, channel: String = "firebase") {
-        lastSyncError = message
-        syncLocalStore.saveLastError(channel, message)
+        val redacted = redactError(message)
+        lastSyncError = redacted
+        syncLocalStore.saveLastError(channel, redacted)
         db?.child(FirebasePaths.deviceSecurityRuntime(deviceId))
             ?.updateChildren(
                 mapOf(
-                    "lastSyncError" to message,
+                    "lastSyncError" to redacted,
                     "updatedAt" to ServerValue.TIMESTAMP
                 )
             )
@@ -262,10 +263,17 @@ class TvSyncService : Service() {
             ?.updateChildren(
                 mapOf(
                     "lastFailedChannel" to channel,
-                    "lastError" to message,
+                    "lastError" to redacted,
                     "lastErrorAt" to ServerValue.TIMESTAMP
                 )
             )
+    }
+
+    private fun redactError(message: String?): String? {
+        return message
+            ?.replace(Regex("https?://\\S+"), "[redacted-url]")
+            ?.replace(Regex("[A-Za-z0-9_-]{24,}"), "[redacted]")
+            ?.take(200)
     }
 
     private fun clearSyncError() {
@@ -340,7 +348,14 @@ class TvSyncService : Service() {
             ?: 0L
         fallbackStore.savePin(
             snapshot.pin?.let { pin ->
-                PinRecord(pin.salt, pin.hash, pin.updatedAt ?: 0L)
+                PinRecord(
+                    salt = pin.salt,
+                    hash = pin.hash,
+                    version = pin.version,
+                    algorithm = pin.algorithm,
+                    iterations = pin.iterations,
+                    updatedAt = pin.updatedAt ?: 0L
+                )
             }
         )
         saveEffectivePolicies()
@@ -399,49 +414,67 @@ class TvSyncService : Service() {
                 override fun onChildAdded(snapshot: DataSnapshot, previousChildName: String?) {
                     if (snapshot.child("status").getValue(String::class.java) != PolicyConstants.PAIR_PENDING) return
                     val parentUid = snapshot.child("parentUid").getValue(String::class.java) ?: return
+                    if (!pairingManager.pairedParentUid().isNullOrBlank()) {
+                        rejectPairRequest(snapshot, "TV is already paired")
+                        return
+                    }
                     val secret = snapshot.child("secret").getValue(String::class.java)
                     val code = snapshot.child("code").getValue(String::class.java)
                     val createdAt = snapshot.child("createdAt").getValue(Long::class.java) ?: 0L
                     if (!pairingManager.isValid(secret, code, createdAt)) {
-                        Log.w(TAG, "Rejected pair request ${snapshot.key}: invalid secret/code")
                         val expiresAt = snapshot.child("expiresAt").getValue(Long::class.java) ?: 0L
                         val expired = expiresAt > 0L && serverClock.now() > expiresAt
-                        snapshot.ref.updateChildren(
-                            mapOf(
-                                "status" to if (expired) PolicyConstants.PAIR_EXPIRED else PolicyConstants.PAIR_REJECTED,
-                                "respondedAt" to ServerValue.TIMESTAMP,
-                                "error" to if (expired) "Pair request expired" else "Invalid pairing secret or code"
-                            )
+                        rejectPairRequest(
+                            snapshot,
+                            if (expired) "Pair request expired" else "Invalid pairing credentials",
+                            if (expired) PolicyConstants.PAIR_EXPIRED else PolicyConstants.PAIR_REJECTED,
+                            rotateCredentials = expired
                         )
                         return
                     }
 
                     val deviceLabel = "${Build.MANUFACTURER} ${Build.MODEL}".trim()
                     val requestPath = FirebasePaths.pairRequest(deviceId, snapshot.key ?: return)
-                    val updates = mapOf<String, Any?>(
-                        "${FirebasePaths.deviceMeta(deviceId)}/ownerUid" to parentUid,
-                        "${FirebasePaths.deviceMeta(deviceId)}/pairedAt" to ServerValue.TIMESTAMP,
-                        "${FirebasePaths.userDevice(parentUid, deviceId)}/deviceId" to deviceId,
-                        "${FirebasePaths.userDevice(parentUid, deviceId)}/label" to deviceLabel,
-                        "${FirebasePaths.userDevice(parentUid, deviceId)}/pairedAt" to ServerValue.TIMESTAMP,
-                        "${FirebasePaths.userDevice(parentUid, deviceId)}/lastSeen" to ServerValue.TIMESTAMP,
-                        "$requestPath/status" to PolicyConstants.PAIR_ACCEPTED,
-                        "$requestPath/respondedAt" to ServerValue.TIMESTAMP
-                    )
-                    db?.updateChildren(updates)
-                        ?.addOnSuccessListener {
-                            pairingManager.markPaired(parentUid)
-                            Log.i(TAG, "Accepted pair request ${snapshot.key} for parent $parentUid")
+                    val ownerRef = db?.child(FirebasePaths.deviceMeta(deviceId))?.child("ownerUid") ?: return
+                    ownerRef.runTransaction(object : Transaction.Handler {
+                        override fun doTransaction(currentData: MutableData): Transaction.Result {
+                            if (!currentData.getValue(String::class.java).isNullOrBlank()) {
+                                return Transaction.abort()
+                            }
+                            currentData.value = parentUid
+                            return Transaction.success(currentData)
                         }
-                        ?.addOnFailureListener { error ->
-                            snapshot.ref.updateChildren(
-                                mapOf(
-                                    "status" to PolicyConstants.PAIR_FAILED,
-                                    "respondedAt" to ServerValue.TIMESTAMP,
-                                    "error" to (error.message ?: "Pairing update failed")
-                                )
+
+                        override fun onComplete(
+                            error: DatabaseError?,
+                            committed: Boolean,
+                            currentData: DataSnapshot?
+                        ) {
+                            if (error != null || !committed) {
+                                rejectPairRequest(snapshot, "TV is already paired")
+                                return
+                            }
+                            val updates = mapOf<String, Any?>(
+                                "${FirebasePaths.deviceMeta(deviceId)}/pairedAt" to ServerValue.TIMESTAMP,
+                                "${FirebasePaths.userDevice(parentUid, deviceId)}/deviceId" to deviceId,
+                                "${FirebasePaths.userDevice(parentUid, deviceId)}/label" to deviceLabel,
+                                "${FirebasePaths.userDevice(parentUid, deviceId)}/pairedAt" to ServerValue.TIMESTAMP,
+                                "${FirebasePaths.userDevice(parentUid, deviceId)}/lastSeen" to ServerValue.TIMESTAMP,
+                                "$requestPath/status" to PolicyConstants.PAIR_ACCEPTED,
+                                "$requestPath/respondedAt" to ServerValue.TIMESTAMP
                             )
+                            db?.updateChildren(updates)
+                                ?.addOnSuccessListener {
+                                    pairingManager.markPaired(parentUid)
+                                    pairingManager.rotateCredentials()
+                                    Log.i(TAG, "Pairing completed")
+                                }
+                                ?.addOnFailureListener {
+                                    releaseOwnerClaim(parentUid)
+                                    rejectPairRequest(snapshot, "Pairing completion failed", PolicyConstants.PAIR_FAILED)
+                                }
                         }
+                    })
                 }
 
                 override fun onChildChanged(snapshot: DataSnapshot, previousChildName: String?) = Unit
@@ -463,7 +496,7 @@ class TvSyncService : Service() {
                     val ownerUid = snapshot.getValue(String::class.java)
                     if (!ownerUid.isNullOrBlank()) {
                         pairingManager.markPaired(ownerUid)
-                        Log.i(TAG, "Recovered paired parent $ownerUid from device meta")
+                        Log.i(TAG, "Recovered paired ownership from device metadata")
                     }
                 }
 
@@ -501,6 +534,40 @@ class TvSyncService : Service() {
                 }
             }
         )
+    }
+
+    private fun rejectPairRequest(
+        snapshot: DataSnapshot,
+        message: String,
+        status: String = PolicyConstants.PAIR_REJECTED,
+        rotateCredentials: Boolean = false
+    ) {
+        snapshot.ref.updateChildren(
+            mapOf(
+                "status" to status,
+                "respondedAt" to ServerValue.TIMESTAMP,
+                "error" to message
+            )
+        )
+        if (rotateCredentials) pairingManager.rotateCredentials()
+    }
+
+    private fun releaseOwnerClaim(parentUid: String) {
+        db?.child(FirebasePaths.deviceMeta(deviceId))
+            ?.child("ownerUid")
+            ?.runTransaction(object : Transaction.Handler {
+                override fun doTransaction(currentData: MutableData): Transaction.Result {
+                    if (currentData.getValue(String::class.java) != parentUid) return Transaction.abort()
+                    currentData.value = null
+                    return Transaction.success(currentData)
+                }
+
+                override fun onComplete(
+                    error: DatabaseError?,
+                    committed: Boolean,
+                    currentData: DataSnapshot?
+                ) = Unit
+            })
     }
 
     private fun attachModesListener() {
@@ -606,6 +673,10 @@ class TvSyncService : Service() {
                             PinRecord(
                                 salt = salt,
                                 hash = hash,
+                                version = snapshot.child("version").getValue(Long::class.java)?.toInt()
+                                    ?: com.guardpulse.parentcontrol.shared.PinHasher.LEGACY_VERSION,
+                                algorithm = snapshot.child("algorithm").getValue(String::class.java),
+                                iterations = snapshot.child("iterations").getValue(Long::class.java)?.toInt(),
                                 updatedAt = snapshot.child("updatedAt").getValue(Long::class.java) ?: 0L
                             )
                         )
@@ -881,6 +952,7 @@ class TvSyncService : Service() {
         val vpnStatus = NetworkFilterController.refreshPreparedStatus(this)
         val backgroundUnrestricted = BackgroundRestrictionStatus.isBatteryUnrestricted(this)
         val safeModeActive = fallbackStore.isSafeModeActive()
+        val pinRecord = fallbackStore.loadPin()
         db?.child(FirebasePaths.deviceSecurityRuntime(deviceId))?.updateChildren(
             mapOf(
                 "enforcementMode" to mode,
@@ -894,14 +966,15 @@ class TvSyncService : Service() {
                 "vpnBlockedCount" to vpnStatus.blockedCount,
                 "vpnLastError" to vpnStatus.lastError,
                 "backgroundUnrestricted" to backgroundUnrestricted,
-                "pinConfigured" to (fallbackStore.loadPin() != null),
+                "pinConfigured" to (pinRecord != null),
+                "pinHashVersion" to (pinRecord?.version ?: 0),
                 "protectionHealthy" to (
                     mode == PolicyConstants.ENFORCEMENT_DEVICE_OWNER ||
                         ((adminActive || !adminSetupAvailable) &&
                             accessibility &&
                             usage &&
                             backgroundUnrestricted &&
-                            fallbackStore.loadPin() != null)
+                            pinRecord != null)
                     ),
                 "lastForegroundPackage" to fallbackStore.lastForeground(),
                 "safeModeActive" to safeModeActive,

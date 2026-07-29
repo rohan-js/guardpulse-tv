@@ -12,6 +12,7 @@ import com.guardpulse.parentcontrol.shared.ControlProtocol
 import com.guardpulse.parentcontrol.shared.ControlSnapshotV2
 import com.guardpulse.parentcontrol.shared.FirebasePaths
 import com.guardpulse.parentcontrol.shared.PackageKeys
+import com.guardpulse.parentcontrol.shared.PinHasher
 import com.guardpulse.parentcontrol.shared.PolicyConstants
 import com.guardpulse.parentcontrol.shared.SyncAppliedRevision
 import com.guardpulse.parentcontrol.shared.SyncRuntimeState
@@ -217,7 +218,15 @@ class ParentSyncRepository(private val database: DatabaseReference) {
             val hash = snapshot.child("hash").getValue(String::class.java)
             observer.onPin(
                 if (!salt.isNullOrBlank() && !hash.isNullOrBlank()) {
-                    ControlPin(salt, hash, snapshot.child("updatedAt").getValue(Long::class.java))
+                    ControlPin(
+                        salt = salt,
+                        hash = hash,
+                        version = snapshot.child("version").getValue(Long::class.java)?.toInt()
+                            ?: PinHasher.LEGACY_VERSION,
+                        algorithm = snapshot.child("algorithm").getValue(String::class.java),
+                        iterations = snapshot.child("iterations").getValue(Long::class.java)?.toInt(),
+                        updatedAt = snapshot.child("updatedAt").getValue(Long::class.java)
+                    )
                 } else {
                     null
                 }
@@ -428,6 +437,7 @@ class ParentSyncRepository(private val database: DatabaseReference) {
         vpnLastError = child("vpnLastError").getValue(String::class.java),
         backgroundUnrestricted = child("backgroundUnrestricted").getValue(Boolean::class.java) ?: false,
         pinConfigured = child("pinConfigured").getValue(Boolean::class.java) ?: false,
+        pinHashVersion = child("pinHashVersion").getValue(Long::class.java)?.toInt() ?: 0,
         protectionHealthy = child("protectionHealthy").getValue(Boolean::class.java) ?: false,
         lastForegroundPackage = child("lastForegroundPackage").getValue(String::class.java),
         lastSyncError = child("lastSyncError").getValue(String::class.java),

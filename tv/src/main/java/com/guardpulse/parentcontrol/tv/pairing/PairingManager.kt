@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Base64
 import com.guardpulse.parentcontrol.shared.DeviceIdentity
 import com.guardpulse.parentcontrol.shared.PolicyConstants
+import com.guardpulse.parentcontrol.tv.security.SecureValueStore
 import java.security.SecureRandom
 
 data class PairingState(
@@ -18,12 +19,17 @@ data class PairingState(
 
 class PairingManager(private val context: Context) {
     private val prefs = context.getSharedPreferences("pairing", Context.MODE_PRIVATE)
+    private val secureStore = SecureValueStore(
+        context,
+        "pairing",
+        "guardpulse.pairing.secrets"
+    )
     private val random = SecureRandom()
 
     fun current(): PairingState {
         val now = System.currentTimeMillis()
-        val existingSecret = prefs.getString("secret", null)
-        val existingCode = prefs.getString("code", null)
+        val existingSecret = secureStore.migratePlaintext("secret")
+        val existingCode = secureStore.migratePlaintext("code")
         val existingCreatedAt = prefs.getLong("createdAt", 0L)
         if (
             !existingSecret.isNullOrBlank() &&
@@ -40,11 +46,9 @@ class PairingManager(private val context: Context) {
             Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING
         )
         val code = (100000 + random.nextInt(900000)).toString()
-        prefs.edit()
-            .putString("secret", secret)
-            .putString("code", code)
-            .putLong("createdAt", now)
-            .apply()
+        secureStore.put("secret", secret)
+        secureStore.put("code", code)
+        prefs.edit().putLong("createdAt", now).apply()
         return PairingState(DeviceIdentity.getOrCreate(context), code, secret, now)
     }
 
@@ -58,20 +62,30 @@ class PairingManager(private val context: Context) {
 
     fun markPaired(parentUid: String) {
         if (parentUid.isBlank()) return
-        prefs.edit()
-            .putString("pairedParentUid", parentUid)
-            .putLong("pairedAt", System.currentTimeMillis())
-            .apply()
+        secureStore.put("pairedParentUid", parentUid)
+        prefs.edit().putLong("pairedAt", System.currentTimeMillis()).apply()
     }
 
-    fun pairedParentUid(): String? = prefs.getString("pairedParentUid", null)
+    fun pairedParentUid(): String? = secureStore.migratePlaintext("pairedParentUid")
 
     fun pairedAt(): Long = prefs.getLong("pairedAt", 0L)
 
     fun clearPairedParent() {
+        secureStore.put("pairedParentUid", null)
         prefs.edit()
             .remove("pairedParentUid")
             .remove("pairedAt")
+            .apply()
+        rotateCredentials()
+    }
+
+    fun rotateCredentials() {
+        secureStore.put("secret", null)
+        secureStore.put("code", null)
+        prefs.edit()
+            .remove("secret")
+            .remove("code")
+            .remove("createdAt")
             .apply()
     }
 }

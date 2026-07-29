@@ -33,6 +33,9 @@ data class ControlSafeMode(
 data class ControlPin(
     val salt: String,
     val hash: String,
+    val version: Int = PinHasher.LEGACY_VERSION,
+    val algorithm: String? = null,
+    val iterations: Int? = null,
     val updatedAt: Long? = null
 )
 
@@ -60,7 +63,8 @@ data class ControlSnapshotV2(
         "revisionId" to revisionId,
         "updatedAt" to updatedAt,
         "updatedBy" to updatedBy,
-        "apps" to apps.mapKeys { PackageKeys.encode(it.key) }.mapValues { it.value.toFirebaseMap() },
+        "apps" to apps.mapKeys { PackageKeys.encode(it.key) }
+            .mapValues { (packageKey, value) -> value.toFirebaseMap(packageKey) },
         "modes" to modes.mapValues { it.value.toFirebaseMap() },
         "activeMode" to activeMode?.toFirebaseMap(),
         "safeMode" to safeMode.toFirebaseMap(),
@@ -132,10 +136,11 @@ object ControlProtocol {
             ?: error("Control revision is missing")
         val apps = parseApps(snapshot.child("apps"))
         val modes = snapshot.child("modes").children.associate { modeSnapshot ->
+            val encodedModeId = modeSnapshot.key ?: error("Mode key is missing")
             val modeId = modeSnapshot.child("modeId").getValue(String::class.java)
-                ?: modeSnapshot.key
-                ?: error("Mode ID is missing")
+                ?: encodedModeId
             require(modeId.isNotBlank()) { "Mode ID is blank" }
+            require(modeId == encodedModeId) { "Mode key does not match mode ID" }
             val name = modeSnapshot.child("name").getValue(String::class.java)
                 ?.trim()
                 ?.takeIf { it.isNotEmpty() }
@@ -163,9 +168,14 @@ object ControlProtocol {
             null
         }
         val safeModeSnapshot = snapshot.child("safeMode")
+        require(safeModeSnapshot.exists()) { "Safe Mode control is missing" }
+        val safeModeEnabled = safeModeSnapshot.child("enabled").getValue(Boolean::class.java)
+            ?: error("Safe Mode enabled flag is missing")
+        val safeModeUntil = safeModeSnapshot.child("until").getValue(Long::class.java)
+            ?: error("Safe Mode expiry is missing")
         val safeMode = ControlSafeMode(
-            enabled = safeModeSnapshot.child("enabled").getValue(Boolean::class.java) ?: false,
-            until = safeModeSnapshot.child("until").getValue(Long::class.java) ?: 0L,
+            enabled = safeModeEnabled,
+            until = safeModeUntil,
             startedAt = safeModeSnapshot.child("startedAt").getValue(Long::class.java),
             startedBy = safeModeSnapshot.child("startedBy").getValue(String::class.java)
         )
@@ -178,7 +188,27 @@ object ControlProtocol {
             val hash = pinSnapshot.child("hash").getValue(String::class.java)
                 ?.takeIf { it.isNotBlank() }
                 ?: error("PIN hash is missing")
-            ControlPin(salt, hash, pinSnapshot.child("updatedAt").getValue(Long::class.java))
+            val version = pinSnapshot.child("version").getValue(Long::class.java)?.toInt()
+                ?: PinHasher.LEGACY_VERSION
+            val algorithm = pinSnapshot.child("algorithm").getValue(String::class.java)
+            val iterations = pinSnapshot.child("iterations").getValue(Long::class.java)?.toInt()
+            require(version in setOf(PinHasher.LEGACY_VERSION, PinHasher.CURRENT_VERSION)) {
+                "Unsupported PIN hash version"
+            }
+            if (version == PinHasher.CURRENT_VERSION) {
+                require(algorithm == PinHasher.CURRENT_ALGORITHM) { "PIN algorithm is invalid" }
+                require(iterations != null && iterations in PinHasher.CURRENT_ITERATIONS..1_000_000) {
+                    "PIN iteration count is invalid"
+                }
+            }
+            ControlPin(
+                salt = salt,
+                hash = hash,
+                version = version,
+                algorithm = algorithm,
+                iterations = iterations,
+                updatedAt = pinSnapshot.child("updatedAt").getValue(Long::class.java)
+            )
         } else {
             null
         }
@@ -221,15 +251,26 @@ object ControlProtocol {
 
     private fun parseApps(snapshot: DataSnapshot): Map<String, ControlAppRule> {
         return snapshot.children.associate { appSnapshot ->
+            val encodedKey = appSnapshot.key ?: error("App policy key is missing")
             val packageName = appSnapshot.child("packageName").getValue(String::class.java)
-                ?: runCatching { PackageKeys.decode(appSnapshot.key.orEmpty()) }.getOrNull()
                 ?: error("App package is missing")
-            val limit = appSnapshot.child("dailyLimitMinutes").getValue(Long::class.java)
-                ?.toInt()
-                ?.takeIf { it in 1..1440 }
+            require(PackageKeys.encode(packageName) == encodedKey) {
+                "App policy key does not match package"
+            }
+            val manualBlocked = appSnapshot.child("manualBlocked").getValue(Boolean::class.java)
+                ?: error("App manualBlocked flag is missing")
+            val limitSnapshot = appSnapshot.child("dailyLimitMinutes")
+            val limit = if (limitSnapshot.exists()) {
+                val raw = limitSnapshot.getValue(Long::class.java)
+                    ?: error("App daily limit is invalid")
+                require(raw in 1L..1440L) { "App daily limit is out of range" }
+                raw.toInt()
+            } else {
+                null
+            }
             packageName to ControlAppRule(
                 packageName = packageName,
-                manualBlocked = appSnapshot.child("manualBlocked").getValue(Boolean::class.java) ?: false,
+                manualBlocked = manualBlocked,
                 dailyLimitMinutes = limit,
                 updatedAt = appSnapshot.child("updatedAt").getValue(Long::class.java)
             )
@@ -237,7 +278,8 @@ object ControlProtocol {
     }
 }
 
-private fun ControlAppRule.toFirebaseMap(): Map<String, Any?> = mapOf(
+private fun ControlAppRule.toFirebaseMap(packageKey: String): Map<String, Any?> = mapOf(
+    "packageKey" to packageKey,
     "packageName" to packageName,
     "manualBlocked" to manualBlocked,
     "dailyLimitMinutes" to dailyLimitMinutes,
@@ -249,7 +291,8 @@ private fun ControlMode.toFirebaseMap(): Map<String, Any?> = mapOf(
     "name" to name,
     "createdAt" to createdAt,
     "updatedAt" to updatedAt,
-    "apps" to apps.mapKeys { PackageKeys.encode(it.key) }.mapValues { it.value.toFirebaseMap() }
+    "apps" to apps.mapKeys { PackageKeys.encode(it.key) }
+        .mapValues { (packageKey, value) -> value.toFirebaseMap(packageKey) }
 )
 
 private fun ControlActiveMode.toFirebaseMap(): Map<String, Any?> = mapOf(
@@ -268,5 +311,8 @@ private fun ControlSafeMode.toFirebaseMap(): Map<String, Any?> = mapOf(
 private fun ControlPin.toFirebaseMap(): Map<String, Any?> = mapOf(
     "salt" to salt,
     "hash" to hash,
+    "version" to version,
+    "algorithm" to algorithm,
+    "iterations" to iterations,
     "updatedAt" to updatedAt
 )

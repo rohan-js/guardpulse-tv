@@ -100,7 +100,7 @@ test("parent can manage modes active mode and safe mode", async () => {
   await assertSucceeds(
     dbAs("parentUid").ref("devices/tv1/security/safeMode").set({
       enabled: true,
-      until: 9999999999999,
+      until: 1800003,
       startedAt: 3,
       startedBy: "parentUid",
     })
@@ -341,11 +341,20 @@ test("V2 rejects missing mode references and unsupported schemas", async () => {
 
 test("TV writes acknowledgements runtime diagnostics and precise usage only", async () => {
   await assertSucceeds(
-    dbAs("tvUid").ref("devices/tv1/sync/applied").set({
-      revisionId: "revision-1",
-      status: "applied",
-      appliedAt: 20,
-      sessionId: "session-1",
+    dbAs("parentUid").ref("devices/tv1").update({
+      "control/v2": {
+        schemaVersion: 2,
+        revisionId: "revision-1",
+        updatedAt: 10,
+        updatedBy: "parentUid",
+        safeMode: { enabled: false, until: 0 },
+      },
+      "sync/desired": {
+        revisionId: "revision-1",
+        kind: "migration",
+        requestedAt: 10,
+        requestedBy: "parentUid",
+      },
     })
   );
   await assertSucceeds(
@@ -356,6 +365,14 @@ test("TV writes acknowledgements runtime diagnostics and precise usage only", as
       lastPolicyAppliedAt: 20,
       lastUsageWriteAt: 21,
       lastSuccessAt: 21,
+    })
+  );
+  await assertSucceeds(
+    dbAs("tvUid").ref("devices/tv1/sync/applied").set({
+      revisionId: "revision-1",
+      status: "applied",
+      appliedAt: 20,
+      sessionId: "session-1",
     })
   );
   await assertSucceeds(
@@ -432,6 +449,9 @@ test("TV acknowledges approved unlock without gaining approval authority", async
 });
 
 test("pair request exposes lifecycle only to its parent and TV", async () => {
+  await testEnv.withSecurityRulesDisabled(async (context) => {
+    await context.database().ref("devices/tv1/meta/ownerUid").remove();
+  });
   await assertSucceeds(
     dbAs("parentUid").ref("pairRequests/tv1/pair1").set({
       parentUid: "parentUid",
@@ -451,5 +471,59 @@ test("pair request exposes lifecycle only to its parent and TV", async () => {
   );
   await assertFails(
     dbAs("parentUid").ref("pairRequests/tv1/pair1").update({ status: "rejected" })
+  );
+});
+
+test("TV cannot replace an existing owner or write another parent's device entry", async () => {
+  await assertFails(
+    dbAs("tvUid").ref("devices/tv1/meta/ownerUid").set("otherParent")
+  );
+  await assertFails(
+    dbAs("tvUid").ref("users/otherParent/devices/tv1").set({
+      deviceId: "tv1",
+      label: "Mi TV",
+    })
+  );
+  await assertSucceeds(
+    dbAs("tvUid").ref().update({
+      "devices/tv1/meta/ownerUid": null,
+      "users/parentUid/devices/tv1": null,
+    })
+  );
+  await assertSucceeds(
+    dbAs("tvUid").ref("devices/tv1/meta/ownerUid").set("otherParent")
+  );
+});
+
+test("new PIN records require valid PBKDF2 parameters while legacy hashes remain valid", async () => {
+  await assertSucceeds(
+    dbAs("parentUid").ref("devices/tv1/security/pin").set({
+      salt: "abcdefghijklmnopqrstuv",
+      hash: "abcdefghijklmnopqrstuvwxyzABCDEFGH123456789",
+      version: 2,
+      algorithm: "PBKDF2WithHmacSHA256",
+      iterations: 210000,
+      updatedAt: 1,
+      updatedBy: "parentUid",
+    })
+  );
+  await assertFails(
+    dbAs("parentUid").ref("devices/tv1/security/pin").set({
+      salt: "abcdefghijklmnopqrstuv",
+      hash: "abcdefghijklmnopqrstuvwxyzABCDEFGH123456789",
+      version: 2,
+      algorithm: "SHA-256",
+      iterations: 1,
+      updatedAt: 2,
+      updatedBy: "parentUid",
+    })
+  );
+  await assertSucceeds(
+    dbAs("parentUid").ref("devices/tv1/security/pin").set({
+      salt: "abcdefghijklmnopqrstuv",
+      hash: "abcdefghijklmnopqrstuvwxyzABCDEFGH123456789",
+      updatedAt: 3,
+      updatedBy: "parentUid",
+    })
   );
 });

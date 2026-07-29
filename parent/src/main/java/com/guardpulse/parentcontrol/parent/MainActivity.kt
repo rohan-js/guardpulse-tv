@@ -83,6 +83,7 @@ import androidx.compose.ui.unit.dp
 import com.guardpulse.parentcontrol.shared.PolicyConstants
 import com.guardpulse.parentcontrol.shared.ControlProtocol
 import com.guardpulse.parentcontrol.shared.DeviceFreshness
+import com.guardpulse.parentcontrol.shared.PinHasher
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import java.text.SimpleDateFormat
@@ -1413,6 +1414,13 @@ private fun SecurityTab(
                     security.backgroundUnrestricted
                 )
                 RuntimeRow("PIN", if (security.pinConfigured) "Configured" else "Missing", security.pinConfigured)
+                if (security.pinConfigured && security.pinHashVersion in 0 until PinHasher.CURRENT_VERSION) {
+                    Text(
+                        "PIN security upgrade required. Set a new PIN below to upgrade protection.",
+                        color = AlertRed,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                }
                 RuntimeRow("Healthy", if (security.protectionHealthy) "Healthy" else "Needs setup", security.protectionHealthy)
                 RuntimeRow("Active Mode", activeMode.modeName ?: "Normal policy", activeMode.modeId != null)
                 RuntimeRow(
@@ -1569,6 +1577,13 @@ private fun SecurityTab(
         item {
             GuardCard {
                 Text("Parent PIN", style = MaterialTheme.typography.titleLarge, color = GuardNavy, fontWeight = FontWeight.Bold)
+                if (security.pinConfigured && security.pinHashVersion in 0 until PinHasher.CURRENT_VERSION) {
+                    Text(
+                        "Your existing PIN still works, but it uses legacy hashing. Set it again to upgrade security.",
+                        color = AlertRed,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                }
                 Row(Modifier.fillMaxWidth().padding(top = 18.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     repeat(6) { index ->
                         Box(

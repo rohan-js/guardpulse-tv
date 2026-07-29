@@ -34,6 +34,7 @@ import com.guardpulse.parentcontrol.shared.FirebaseServerClock
 import com.guardpulse.parentcontrol.shared.PinHasher
 import com.guardpulse.parentcontrol.shared.PolicyConstants
 import com.guardpulse.parentcontrol.tv.policy.LocalPolicyStore
+import com.guardpulse.parentcontrol.tv.sync.TamperEventQueue
 
 class LockActivity : Activity() {
     private lateinit var fallbackStore: FallbackStateStore
@@ -393,12 +394,28 @@ class LockActivity : Activity() {
     }
 
     private fun checkPin() {
+        val retryMs = fallbackStore.pinRetryRemainingMs()
+        if (retryMs > 0L) {
+            statusText?.text = "Try again in ${((retryMs + 999L) / 1_000L)} seconds"
+            pin = ""
+            updatePinDisplay()
+            return
+        }
         val record = fallbackStore.loadPin()
         if (record == null) {
             statusText?.text = "PIN is not configured. Use remote approval from the parent app."
             return
         }
-        if (PinHasher.verify(pin, record.salt, record.hash)) {
+        if (PinHasher.verify(
+                pin = pin,
+                salt = record.salt,
+                expectedHash = record.hash,
+                version = record.version,
+                algorithm = record.algorithm,
+                iterations = record.iterations
+            )
+        ) {
+            fallbackStore.clearFailedPinAttempts()
             if (isSettingsSectionGate()) {
                 settingsSectionKey?.let(fallbackStore::grantSettingsSectionUnlock)
             } else if (isSetupGate()) {
@@ -408,7 +425,17 @@ class LockActivity : Activity() {
             }
             finishAndReturnToUnlockedTarget()
         } else {
-            statusText?.text = "Incorrect PIN"
+            val retry = fallbackStore.recordFailedPinAttempt()
+            statusText?.text = "Incorrect PIN. Try again in ${retry.delayMs / 1_000L} seconds"
+            if (retry.attempts >= PIN_TAMPER_THRESHOLD &&
+                fallbackStore.shouldReportTamper(PolicyConstants.TAMPER_PIN_RETRY_LOCKED)
+            ) {
+                TamperEventQueue.enqueue(
+                    applicationContext,
+                    PolicyConstants.TAMPER_PIN_RETRY_LOCKED,
+                    "Repeated incorrect PIN attempts were blocked"
+                )
+            }
             pin = ""
             updatePinDisplay()
         }
@@ -643,6 +670,7 @@ class LockActivity : Activity() {
     }
 
     companion object {
+        private const val PIN_TAMPER_THRESHOLD = 4
         const val EXTRA_PACKAGE_NAME = "packageName"
         const val EXTRA_REASON = "reason"
         const val EXTRA_SETTINGS_SECTION_KEY = "settingsSectionKey"

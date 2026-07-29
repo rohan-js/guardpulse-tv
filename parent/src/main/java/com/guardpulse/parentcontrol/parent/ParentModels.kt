@@ -89,6 +89,7 @@ data class SecurityRuntime(
     val vpnLastError: String? = null,
     val backgroundUnrestricted: Boolean = false,
     val pinConfigured: Boolean = false,
+    val pinHashVersion: Int = 0,
     val protectionHealthy: Boolean = false,
     val lastForegroundPackage: String? = null,
     val lastSyncError: String? = null,

@@ -1,6 +1,7 @@
 package com.guardpulse.parentcontrol.tv
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.res.ColorStateList
 import android.content.ActivityNotFoundException
 import android.content.Intent
@@ -391,7 +392,7 @@ class MainActivity : Activity() {
             })
             addView(statusBox(
                 if (!pairedParentUid.isNullOrBlank()) {
-                    "Paired with parent account: ${pairedParentUid.take(8)}..."
+                    "Paired with a parent account."
                 } else {
                     "Parent App > Devices > Scan QR, or enter this code."
                 },
@@ -407,7 +408,58 @@ class MainActivity : Activity() {
                 textSize = 12f
                 maxLines = 2
             })
+            if (!pairedParentUid.isNullOrBlank()) {
+                addView(actionButton("Emergency Reset Pairing", true) {
+                    confirmPairingResetFirst(pairedParentUid)
+                }.apply {
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                    ).apply { topMargin = dp(12) }
+                })
+            }
         }
+    }
+
+    private fun confirmPairingResetFirst(parentUid: String) {
+        AlertDialog.Builder(this)
+            .setTitle("Reset pairing?")
+            .setMessage("Use this only when the parent app cannot unpair this TV. Protection and the PIN stay on this TV.")
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Continue") { _, _ -> confirmPairingResetFinal(parentUid) }
+            .show()
+    }
+
+    private fun confirmPairingResetFinal(parentUid: String) {
+        AlertDialog.Builder(this)
+            .setTitle("Confirm emergency reset")
+            .setMessage("The current parent will lose control of this TV. A new pairing is required.")
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Reset Pairing") { _, _ -> resetPairing(parentUid) }
+            .show()
+    }
+
+    private fun resetPairing(parentUid: String) {
+        val status = FirebaseBootstrap.initialize(this)
+        if (!status.configured) {
+            showAction("Firebase is not configured. Pairing was not reset.")
+            return
+        }
+        val deviceId = DeviceIdentity.getOrCreate(this)
+        val updates = mapOf<String, Any?>(
+            "${FirebasePaths.deviceMeta(deviceId)}/ownerUid" to null,
+            "${FirebasePaths.deviceMeta(deviceId)}/pairedAt" to null,
+            FirebasePaths.userDevice(parentUid, deviceId) to null
+        )
+        FirebaseDatabase.getInstance().reference.updateChildren(updates)
+            .addOnSuccessListener {
+                pairingManager.clearPairedParent()
+                showAction("Pairing reset. Open this setup screen again to pair a parent.")
+                render()
+            }
+            .addOnFailureListener {
+                showAction("Pairing reset could not be confirmed. Check the TV connection and try again.")
+            }
     }
 
     private fun setupCard(
@@ -570,7 +622,7 @@ class MainActivity : Activity() {
                     .apply { setMargins(0, dp(8), 0, dp(20)) }
             })
             if (!pairedParentUid.isNullOrBlank()) {
-                addView(statusBox("Paired with parent account\nParent UID: ${pairedParentUid.take(8)}...", true))
+                addView(statusBox("Paired with a parent account.", true))
             } else {
                 addView(statusBox("Open the Parent App > Devices > Scan QR, or enter this manual code.", false))
             }
