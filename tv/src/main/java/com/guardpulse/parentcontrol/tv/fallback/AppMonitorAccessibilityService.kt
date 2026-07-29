@@ -133,12 +133,15 @@ class AppMonitorAccessibilityService : AccessibilityService() {
         val current = fallbackStore.liveForegroundSession()
         if (usagePackage == null) {
             if (current != null) {
-                fallbackStore.clearLiveForegroundSession()
+                fallbackStore.finalizeLiveForegroundSession()
                 runCatching { TvServiceStarter.start(this, TvSyncService.ACTION_FOREGROUND_CHANGED) }
             }
             return
         }
-        if (current?.packageName == usagePackage) return
+        if (current?.packageName == usagePackage) {
+            fallbackStore.refreshLiveForegroundSession()
+            return
+        }
         val baselineMs = usageTracker.rawUsageMillisToday()[usagePackage] ?: 0L
         fallbackStore.startLiveForegroundSession(usagePackage, baselineMs)
         runCatching { TvServiceStarter.start(this, TvSyncService.ACTION_FOREGROUND_CHANGED) }
@@ -162,7 +165,10 @@ class AppMonitorAccessibilityService : AccessibilityService() {
         val limit = policies[usagePackage]?.dailyLimitMinutes ?: return
         val usageOffsetMs = localPolicyStore.loadUsageOffsetsMs()[usagePackage] ?: 0L
         val usedMs = (
-            (usageTracker.effectiveUsageMillisToday(fallbackStore.liveForegroundSession())[usagePackage] ?: 0L) -
+            (usageTracker.effectiveUsageMillisToday(
+                fallbackStore.liveForegroundSession(),
+                fallbackStore.committedUsageMillisToday()
+            )[usagePackage] ?: 0L) -
                 usageOffsetMs
             ).coerceAtLeast(0L)
         if (usedMs < limit * 60_000L) return
@@ -199,6 +205,7 @@ class AppMonitorAccessibilityService : AccessibilityService() {
     }
 
     override fun onDestroy() {
+        if (::fallbackStore.isInitialized) fallbackStore.finalizeLiveForegroundSession()
         if (::localPolicyStore.isInitialized) {
             localPolicyStore.unregisterChangeListener(policyChangeListener)
         }

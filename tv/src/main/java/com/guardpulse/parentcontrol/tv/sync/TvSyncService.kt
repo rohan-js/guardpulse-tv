@@ -684,7 +684,10 @@ class TvSyncService : Service() {
                 finishCommand(commandId, ref, result)
             }
             PolicyConstants.COMMAND_RESET_TODAY -> {
-                val currentUsage = usageTracker.effectiveUsageMillisToday(fallbackStore.liveForegroundSession())
+                val currentUsage = usageTracker.effectiveUsageMillisToday(
+                    fallbackStore.liveForegroundSession(),
+                    fallbackStore.committedUsageMillisToday()
+                )
                 if (packageName == null) {
                     localPolicyStore.clearDailyLimitBlocks()
                     currentUsage.forEach { (pkg, usageMs) ->
@@ -924,7 +927,10 @@ class TvSyncService : Service() {
         saveEffectivePolicies()
         val policies = localPolicyStore.loadPolicies()
         val liveSession = fallbackStore.liveForegroundSession()
-        val rawUsageMs = usageTracker.effectiveUsageMillisToday(liveSession)
+        val rawUsageMs = usageTracker.effectiveUsageMillisToday(
+            liveSession,
+            fallbackStore.committedUsageMillisToday()
+        )
         val usageOffsetsMs = localPolicyStore.loadUsageOffsetsMs()
         val dailyBlocks = localPolicyStore.loadDailyLimitBlocks().toMutableSet()
         val states = mutableMapOf<String, Any?>()
@@ -1037,7 +1043,6 @@ class TvSyncService : Service() {
             states[PackageKeys.encode(packageName)] = null
         }
 
-        enforceCurrentForegroundLock(policies, dailyBlocks)
         val root = db ?: run {
             onComplete?.invoke(Result.failure(IllegalStateException("Firebase is unavailable")))
             return
@@ -1094,7 +1099,10 @@ class TvSyncService : Service() {
         val root = db ?: return
         val session = fallbackStore.liveForegroundSession() ?: return
         val packageName = session.packageName
-        val rawUsageMs = usageTracker.effectiveUsageMillisToday(session)[packageName] ?: return
+        val rawUsageMs = usageTracker.effectiveUsageMillisToday(
+            session,
+            fallbackStore.committedUsageMillisToday()
+        )[packageName] ?: return
         val offsetMs = localPolicyStore.loadUsageOffsetsMs()[packageName] ?: 0L
         val usageMs = (rawUsageMs - offsetMs).coerceAtLeast(0L)
         val statePath = FirebasePaths.deviceStateApp(deviceId, packageName)
@@ -1151,26 +1159,6 @@ class TvSyncService : Service() {
             localPolicyStore.saveSafeMode(0L)
             fallbackStore.saveSafeMode(0L)
         }
-    }
-
-    private fun enforceCurrentForegroundLock(
-        policies: Map<String, AppPolicy>,
-        dailyBlocks: Set<String>
-    ) {
-        val foregroundPackage = fallbackStore.lastForeground() ?: return
-        val decision = FallbackProtection.shouldLock(
-            context = this,
-            foregroundPackage = foregroundPackage,
-            policies = policies,
-            dailyBlocks = dailyBlocks,
-            fallbackStore = fallbackStore
-        )
-        if (!decision.locked) return
-        FallbackProtection.openLock(
-            this,
-            decision.policyPackage ?: foregroundPackage,
-            decision.reason ?: PolicyConstants.BLOCK_REASON_MANUAL
-        )
     }
 
     private val tickRunnable = object : Runnable {

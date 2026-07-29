@@ -48,8 +48,6 @@ class LockActivity : Activity() {
     private var requestId: String? = null
     private var unlockRequestRef: DatabaseReference? = null
     private var unlockRequestListener: ValueEventListener? = null
-    private var policyDismissRef: DatabaseReference? = null
-    private var policyDismissListener: ValueEventListener? = null
     private val keypadButtons = mutableListOf<MaterialButton>()
     private var remoteUnlockButton: MaterialButton? = null
     private val guardNavy = Color.rgb(3, 22, 54)
@@ -88,7 +86,6 @@ class LockActivity : Activity() {
         serverClock.start()
         bindLockIntent(intent)
         localPolicyStore.registerChangeListener(policyChangeListener)
-        attachPolicyDismissListener()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -96,7 +93,6 @@ class LockActivity : Activity() {
         setIntent(intent)
         detachRemoteListeners()
         bindLockIntent(intent)
-        attachPolicyDismissListener()
         startAutoDismissChecks()
     }
 
@@ -143,11 +139,6 @@ class LockActivity : Activity() {
         }
         unlockRequestListener = null
         unlockRequestRef = null
-        policyDismissListener?.let { listener ->
-            policyDismissRef?.removeEventListener(listener)
-        }
-        policyDismissListener = null
-        policyDismissRef = null
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -455,44 +446,6 @@ class LockActivity : Activity() {
         autoDismissRunnable.run()
     }
 
-    private fun attachPolicyDismissListener() {
-        if (isSetupGate()) return
-        val status = FirebaseBootstrap.initialize(this)
-        if (!status.configured) return
-        val auth = FirebaseAuth.getInstance()
-        if (auth.currentUser == null) {
-            auth.signInAnonymously()
-                .addOnSuccessListener { attachPolicyDismissListener() }
-            return
-        }
-        val deviceId = DeviceIdentity.getOrCreate(this)
-        val ref = FirebaseDatabase.getInstance().reference
-            .child(FirebasePaths.devicePolicyApp(deviceId, packageNameToUnlock))
-        val listener = object : ValueEventListener {
-            override fun onDataChange(snapshot: DataSnapshot) {
-                finishIfRemotePolicyAllows(snapshot)
-            }
-
-            override fun onCancelled(error: DatabaseError) = Unit
-        }
-        policyDismissRef = ref
-        policyDismissListener = listener
-        ref.addValueEventListener(listener)
-    }
-
-    private fun finishIfRemotePolicyAllows(snapshot: DataSnapshot) {
-        if (isSetupGate()) return
-        if (localPolicyStore.activeModeId() != null) return
-        val manualBlocked = snapshot.child("manualBlocked").getValue(Boolean::class.java)
-        val explicitAllow = snapshot.exists() && manualBlocked == false
-        val policyMissingAndAllowedByDefault = !snapshot.exists() &&
-            !PolicyConstants.isDefaultLocked(packageNameToUnlock)
-        if ((explicitAllow || policyMissingAndAllowedByDefault) &&
-            packageNameToUnlock !in localPolicyStore.loadDailyLimitBlocks()
-        ) {
-            finishAndReturnToUnlockedTarget()
-        }
-    }
 
     private fun createRemoteUnlockRequest() {
         if (requestId != null) {

@@ -44,9 +44,14 @@ class UsageTracker(private val context: Context) {
 
     fun effectiveUsageMillisToday(
         liveSession: LiveForegroundSession? = null,
+        committedUsageMs: Map<String, Long> = emptyMap(),
         now: Long = System.currentTimeMillis()
     ): Map<String, Long> {
-        return applyLiveForegroundSession(rawUsageMillisToday(), liveSession, now, DateKeys.today())
+        val baseline = rawUsageMillisToday().toMutableMap()
+        committedUsageMs.forEach { (packageName, usageMs) ->
+            baseline[packageName] = maxOf(baseline[packageName] ?: 0L, usageMs)
+        }
+        return applyLiveForegroundSession(baseline, liveSession, now, DateKeys.today())
     }
 
     fun usageMinutesToday(liveSession: LiveForegroundSession? = null): Map<String, Long> {
@@ -68,7 +73,8 @@ class UsageTracker(private val context: Context) {
             today: String
         ): Map<String, Long> {
             if (liveSession == null || liveSession.dayKey != today) return baselineUsageMs
-            val elapsedMs = (now - liveSession.startedAt).coerceAtLeast(0L)
+            val observedEnd = minOf(now, liveSession.lastObservedAt + 1_500L)
+            val elapsedMs = (observedEnd - liveSession.startedAt).coerceAtLeast(0L)
             val liveUsageMs = liveSession.baselineUsageMs + elapsedMs
             val currentUsageMs = baselineUsageMs[liveSession.packageName] ?: 0L
             val effectiveUsageMs = maxOf(currentUsageMs, liveUsageMs)
