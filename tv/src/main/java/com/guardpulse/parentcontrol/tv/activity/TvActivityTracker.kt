@@ -1,0 +1,340 @@
+package com.guardpulse.parentcontrol.tv.activity
+
+import android.content.Context
+import android.view.accessibility.AccessibilityNodeInfo
+import com.guardpulse.parentcontrol.shared.PolicyConstants
+import com.guardpulse.parentcontrol.tv.fallback.LockActivity
+import java.util.UUID
+
+class TvActivityTracker(private val context: Context) {
+    private val store = ActivityStore(context)
+    private var pendingMediaSignature: String? = null
+    private var pendingMediaCount = 0
+
+    fun observe(
+        runtimePackage: String,
+        eventClassName: CharSequence?,
+        eventText: List<CharSequence>,
+        windowTitles: List<CharSequence>,
+        root: AccessibilityNodeInfo?
+    ): Boolean {
+        val now = System.currentTimeMillis()
+        val current = store.current()
+        if (runtimePackage == "com.android.systemui") return false
+        if (runtimePackage == context.packageName) {
+            if (current == null) return false
+            val lockClass = eventClassName?.toString()?.contains(LockActivity::class.java.simpleName) == true ||
+                eventClassName?.toString() == LockActivity::class.java.name
+            if (!lockClass && current.overlayState == ActivitySnapshot.OVERLAY_LOCKED) return false
+            if (current.overlayState == ActivitySnapshot.OVERLAY_LOCKED) return false
+            store.saveCurrent(current.copy(overlayState = ActivitySnapshot.OVERLAY_LOCKED, updatedAt = now))
+            return true
+        }
+
+        val policyPackage = PolicyConstants.sourceLockPolicyPackage(runtimePackage) ?: runtimePackage
+        val label = appLabel(policyPackage)
+        val appChanged = current == null || current.packageName != policyPackage
+        var snapshot = if (appChanged) {
+            current?.let { closeCurrentSessions(it, now) }
+            pendingMediaSignature = null
+            pendingMediaCount = 0
+            ActivitySnapshot(
+                runtimePackage = runtimePackage,
+                packageName = policyPackage,
+                appLabel = label,
+                appStartedAt = now,
+                overlayState = ActivitySnapshot.OVERLAY_NONE,
+                updatedAt = now
+            )
+        } else {
+            requireNotNull(current).copy(
+                runtimePackage = runtimePackage,
+                overlayState = ActivitySnapshot.OVERLAY_NONE,
+                updatedAt = now
+            )
+        }
+
+        val nodes = collectNodes(root, eventText, windowTitles)
+        val media = MediaAccessibilityParser.parse(runtimePackage, nodes)
+        if (media != null) {
+            val signature = listOf(media.title, media.subtitle, media.durationMs).joinToString("|")
+            if (signature == pendingMediaSignature) {
+                pendingMediaCount++
+            } else {
+                pendingMediaSignature = signature
+                pendingMediaCount = 1
+            }
+            val stable = pendingMediaCount >= 2 ||
+                media.durationMs != null ||
+                media.confidence == MediaObservation.CONFIDENCE_HIGH
+            if (stable) {
+                if (snapshot.mediaTitle != null &&
+                    media.title != null &&
+                    snapshot.mediaTitle != media.title
+                ) {
+                    closeMediaSession(snapshot, now)
+                    snapshot = snapshot.clearMedia()
+                }
+                val capturedPosition = media.positionMs ?: snapshot.estimatedPosition(now)
+                snapshot = snapshot.copy(
+                    mediaTitle = media.title ?: snapshot.mediaTitle,
+                    mediaSubtitle = media.subtitle ?: snapshot.mediaSubtitle,
+                    playbackState = media.playbackState.takeUnless {
+                        it == MediaObservation.PLAYBACK_UNKNOWN
+                    } ?: snapshot.playbackState,
+                    positionMs = capturedPosition,
+                    durationMs = media.durationMs ?: snapshot.durationMs,
+                    positionCapturedAt = capturedPosition?.let { now },
+                    playbackSpeed = if (media.playbackState == MediaObservation.PLAYBACK_PLAYING) 1f else 0f,
+                    mediaStartedAt = snapshot.mediaStartedAt ?: now,
+                    mediaConfidence = strongerConfidence(snapshot.mediaConfidence, media.confidence),
+                    captureSource = combineCaptureSources(snapshot.captureSource, media.captureSource),
+                    updatedAt = now
+                )
+            }
+        }
+
+        val changed = snapshot != current
+        if (changed) store.saveCurrent(snapshot)
+        return changed
+    }
+
+    fun current(): ActivitySnapshot? = store.current()
+
+    fun observeAudioPlayback(runtimePackage: String, isPlaying: Boolean): Boolean {
+        val current = store.current() ?: return false
+        val policyPackage = PolicyConstants.sourceLockPolicyPackage(runtimePackage) ?: runtimePackage
+        if (current.packageName != policyPackage) return false
+        val nextPlaybackState = if (isPlaying) MediaObservation.PLAYBACK_PLAYING else MediaObservation.PLAYBACK_PAUSED
+        val nextSource = combineCaptureSources(current.captureSource, MediaObservation.SOURCE_AUDIO)
+        val nextSpeed = if (isPlaying) 1f else 0f
+        val now = System.currentTimeMillis()
+        if (current.playbackState == nextPlaybackState &&
+            current.captureSource == nextSource &&
+            current.playbackSpeed == nextSpeed
+        ) {
+            return false
+        }
+        store.saveCurrent(
+            current.copy(
+                playbackState = nextPlaybackState,
+                playbackSpeed = nextSpeed,
+                captureSource = nextSource,
+                updatedAt = now
+            )
+        )
+        return true
+    }
+
+    fun observeMediaBrowser(
+        runtimePackage: String,
+        title: String?,
+        subtitle: String?,
+        playbackState: String?,
+        positionMs: Long?,
+        durationMs: Long?
+    ): Boolean {
+        val now = System.currentTimeMillis()
+        val current = store.current() ?: return false
+        val policyPackage = PolicyConstants.sourceLockPolicyPackage(runtimePackage) ?: runtimePackage
+        if (current.packageName != policyPackage) return false
+        val nextTitle = title?.takeIf(String::isNotBlank) ?: current.mediaTitle
+        val nextSubtitle = subtitle?.takeIf(String::isNotBlank) ?: current.mediaSubtitle
+        val nextState = playbackState?.takeIf { it != MediaObservation.PLAYBACK_UNKNOWN } ?: current.playbackState
+        val nextPosition = positionMs ?: current.positionMs
+        val nextDuration = durationMs ?: current.durationMs
+        val nextSpeed = if (nextState == MediaObservation.PLAYBACK_PLAYING) 1f else 0f
+        val nextSource = combineCaptureSources(current.captureSource, MediaObservation.SOURCE_MEDIA_BROWSER)
+        val changed = current.mediaTitle != nextTitle ||
+            current.mediaSubtitle != nextSubtitle ||
+            current.playbackState != nextState ||
+            current.positionMs != nextPosition ||
+            current.durationMs != nextDuration ||
+            current.playbackSpeed != nextSpeed ||
+            current.captureSource != nextSource
+        if (!changed) return false
+        store.saveCurrent(
+            current.copy(
+                mediaTitle = nextTitle,
+                mediaSubtitle = nextSubtitle,
+                playbackState = nextState,
+                positionMs = nextPosition,
+                durationMs = nextDuration,
+                playbackSpeed = nextSpeed,
+                captureSource = nextSource,
+                mediaStartedAt = current.mediaStartedAt ?: now,
+                mediaConfidence = strongerConfidence(current.mediaConfidence, MediaObservation.CONFIDENCE_HIGH),
+                updatedAt = now
+            )
+        )
+        return true
+    }
+
+    fun refreshCurrentForUpload(now: Long = System.currentTimeMillis()) {
+        val current = store.current() ?: return
+        store.saveCurrent(
+            current.copy(
+                positionMs = current.estimatedPosition(now),
+                positionCapturedAt = current.positionMs?.let { now },
+                updatedAt = now
+            )
+        )
+    }
+
+    fun observePackageOnly(runtimePackage: String): Boolean {
+        if (runtimePackage == context.packageName || runtimePackage == "com.android.systemui") return false
+        return observe(runtimePackage, null, emptyList(), emptyList(), null)
+    }
+
+    fun pendingHistory(): List<ActivityHistoryRecord> = store.pendingHistory()
+
+    fun markUploaded(id: String) = store.markUploaded(id)
+
+    fun pruneBefore(cutoff: Long) = store.pruneBefore(cutoff)
+
+    private fun closeCurrentSessions(snapshot: ActivitySnapshot, endedAt: Long) {
+        closeMediaSession(snapshot, endedAt)
+        if (endedAt - snapshot.appStartedAt >= MIN_SESSION_MS) {
+            store.addHistory(
+                ActivityHistoryRecord(
+                    id = UUID.randomUUID().toString(),
+                    type = ActivityHistoryRecord.TYPE_APP,
+                    packageName = snapshot.packageName,
+                    appLabel = snapshot.appLabel,
+                    title = null,
+                    subtitle = null,
+                    startedAt = snapshot.appStartedAt,
+                    endedAt = endedAt,
+                    lastPositionMs = null,
+                    durationMs = null,
+                    playbackState = null,
+                    confidence = null,
+                    captureSource = snapshot.captureSource
+                )
+            )
+        }
+    }
+
+    private fun closeMediaSession(snapshot: ActivitySnapshot, endedAt: Long) {
+        val mediaStartedAt = snapshot.mediaStartedAt ?: return
+        if (snapshot.mediaTitle.isNullOrBlank() ||
+            snapshot.mediaConfidence == MediaObservation.CONFIDENCE_LOW ||
+            endedAt - mediaStartedAt < MIN_MEDIA_SESSION_MS
+        ) {
+            return
+        }
+        store.addHistory(
+            ActivityHistoryRecord(
+                id = UUID.randomUUID().toString(),
+                type = ActivityHistoryRecord.TYPE_MEDIA,
+                packageName = snapshot.packageName,
+                appLabel = snapshot.appLabel,
+                title = snapshot.mediaTitle,
+                subtitle = snapshot.mediaSubtitle,
+                startedAt = mediaStartedAt,
+                endedAt = endedAt,
+                lastPositionMs = snapshot.estimatedPosition(endedAt),
+                durationMs = snapshot.durationMs,
+                playbackState = snapshot.playbackState,
+                confidence = snapshot.mediaConfidence,
+                captureSource = snapshot.captureSource
+            )
+        )
+    }
+
+    private fun ActivitySnapshot.clearMedia() = copy(
+        mediaTitle = null,
+        mediaSubtitle = null,
+        playbackState = MediaObservation.PLAYBACK_UNKNOWN,
+        positionMs = null,
+        durationMs = null,
+        positionCapturedAt = null,
+        playbackSpeed = 0f,
+        mediaStartedAt = null,
+        mediaConfidence = null
+    )
+
+    private fun ActivitySnapshot.estimatedPosition(now: Long): Long? {
+        val base = positionMs ?: return null
+        val capturedAt = positionCapturedAt ?: return base
+        val estimate = if (playbackState == MediaObservation.PLAYBACK_PLAYING) {
+            base + ((now - capturedAt).coerceAtLeast(0L) * playbackSpeed).toLong()
+        } else {
+            base
+        }
+        return durationMs?.let { estimate.coerceAtMost(it) } ?: estimate
+    }
+
+    private fun appLabel(packageName: String): String {
+        if (packageName in PolicyConstants.sourceLockPackages) return "Live TV"
+        return runCatching {
+            val info = context.packageManager.getApplicationInfo(packageName, 0)
+            context.packageManager.getApplicationLabel(info).toString()
+        }.getOrDefault(packageName)
+    }
+
+    private fun collectNodes(
+        root: AccessibilityNodeInfo?,
+        eventText: List<CharSequence>,
+        windowTitles: List<CharSequence>
+    ): List<AccessibilityTextNode> {
+        val output = mutableListOf<AccessibilityTextNode>()
+        windowTitles.forEach { title ->
+            title.toString().takeIf(String::isNotBlank)?.let {
+                output += AccessibilityTextNode(it, WINDOW_TITLE_VIEW_ID)
+            }
+        }
+        eventText.forEach { text ->
+            text.toString().takeIf(String::isNotBlank)?.let {
+                output += AccessibilityTextNode(it)
+            }
+        }
+        if (root != null) collectNode(root, output, 0)
+        return output.take(MAX_NODES)
+    }
+
+    private fun collectNode(
+        node: AccessibilityNodeInfo,
+        output: MutableList<AccessibilityTextNode>,
+        depth: Int
+    ) {
+        if (depth > MAX_DEPTH || output.size >= MAX_NODES) return
+        node.text?.toString()?.takeIf(String::isNotBlank)?.let {
+            output += AccessibilityTextNode(it, node.viewIdResourceName)
+        }
+        node.contentDescription?.toString()?.takeIf(String::isNotBlank)?.let {
+            output += AccessibilityTextNode(it, node.viewIdResourceName)
+        }
+        for (index in 0 until node.childCount) {
+            node.getChild(index)?.let { child ->
+                collectNode(child, output, depth + 1)
+                child.recycle()
+            }
+        }
+    }
+
+    private fun strongerConfidence(current: String?, next: String): String {
+        val rank = mapOf(
+            MediaObservation.CONFIDENCE_LOW to 0,
+            MediaObservation.CONFIDENCE_MEDIUM to 1,
+            MediaObservation.CONFIDENCE_HIGH to 2
+        )
+        return if ((rank[next] ?: 0) >= (rank[current] ?: -1)) next else current.orEmpty()
+    }
+
+    private fun combineCaptureSources(current: String, next: String): String {
+        if (current == next) return current
+        val parts = linkedSetOf<String>()
+        current.split('+').filter(String::isNotBlank).forEach(parts::add)
+        next.split('+').filter(String::isNotBlank).forEach(parts::add)
+        return if (parts.size == 1) parts.first() else MediaObservation.SOURCE_COMBINED
+    }
+
+    companion object {
+        private const val MAX_DEPTH = 18
+        private const val MAX_NODES = 180
+        private const val MIN_SESSION_MS = 2_000L
+        private const val MIN_MEDIA_SESSION_MS = 3_000L
+        private const val WINDOW_TITLE_VIEW_ID = "__window_title__"
+    }
+}
