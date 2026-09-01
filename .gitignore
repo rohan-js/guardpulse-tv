@@ -23,3 +23,5 @@ tv-install-backups/
 .env.*
 serviceAccount*.json
 *serviceAccount*.json
+.wrangler/
+.zcode/
