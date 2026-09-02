@@ -20,10 +20,15 @@ class AppMonitorAccessibilityService : AccessibilityService() {
     private val lockLaunchGuard = LockLaunchGuard()
     private var lastLiveLimitCheckAt = 0L
     private var lastLiveLimitCheckPackage: String? = null
+    @Volatile private var lastEventHandledAt = 0L
     private val mainHandler = Handler(Looper.getMainLooper())
     private val foregroundPollRunnable = object : Runnable {
         override fun run() {
-            evaluateCurrentWindow()
+            // Events keep the foreground evaluation warm; the poll is only a
+            // safety net for when they stop flowing, so skip while one landed recently.
+            if (System.currentTimeMillis() - lastEventHandledAt >= POLL_EVENT_GRACE_MS) {
+                evaluateCurrentWindow()
+            }
             mainHandler.postDelayed(this, FOREGROUND_RECHECK_MS)
         }
     }
@@ -56,6 +61,7 @@ class AppMonitorAccessibilityService : AccessibilityService() {
             eventText = event.text,
             root = rootInActiveWindow
         )
+        lastEventHandledAt = System.currentTimeMillis()
     }
 
     private fun evaluateCurrentWindow() {
@@ -221,5 +227,6 @@ class AppMonitorAccessibilityService : AccessibilityService() {
     companion object {
         private const val FOREGROUND_RECHECK_MS = 1_000L
         private const val LIVE_LIMIT_CHECK_MS = 5_000L
+        private const val POLL_EVENT_GRACE_MS = 1_500L
     }
 }

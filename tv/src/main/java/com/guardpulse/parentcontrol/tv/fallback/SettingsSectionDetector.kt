@@ -35,6 +35,14 @@ object SettingsSectionDetector {
         "reset" to PolicyConstants.SETTINGS_RESET_PACKAGE
     )
 
+    // Precompiled once: containsStandalonePhrase sits on the per-event hot path and
+    // recompiling the pattern per call was pure waste. Unknown phrases fall back to
+    // on-demand compilation.
+    private val standalonePatterns: Map<String, Regex> =
+        (protectedDevicePreferenceRows.keys + "apps").associateWith { phrase ->
+            standaloneRegex(phrase)
+        }
+
     fun detect(
         packageName: String,
         eventClassName: CharSequence?,
@@ -137,9 +145,11 @@ object SettingsSectionDetector {
     }
 
     private fun containsStandalonePhrase(input: String, phrase: String): Boolean {
-        val escaped = Regex.escape(phrase)
-        return Regex("""(^|[^a-z0-9&])$escaped([^a-z0-9&]|$)""").containsMatchIn(input)
+        return (standalonePatterns[phrase] ?: standaloneRegex(phrase)).containsMatchIn(input)
     }
+
+    private fun standaloneRegex(phrase: String): Regex =
+        Regex("""(^|[^a-z0-9&])${Regex.escape(phrase)}([^a-z0-9&]|$)""")
 
     private fun isTopLevelSettingsHome(input: String): Boolean {
         val hasGeneralSettingsHeader = "general settings" in input

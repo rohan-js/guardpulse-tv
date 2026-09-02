@@ -153,17 +153,29 @@ class FallbackStateStore(context: Context) {
     }
 
     fun saveLastForeground(packageName: String, observedAt: Long = System.currentTimeMillis()) {
+        val previous = memLastForeground
+        memLastForeground = packageName to observedAt
+        if (previous?.first == packageName &&
+            observedAt - lastForegroundPersistedAt < LAST_FOREGROUND_PERSIST_MS
+        ) {
+            return
+        }
         prefs.edit()
             .putString("lastForeground", packageName)
             .putLong("lastForegroundObservedAt", observedAt)
             .putInt("lastForegroundBootCount", bootCount())
             .apply()
+        lastForegroundPersistedAt = observedAt
     }
 
     fun lastForeground(maxAgeMs: Long = FOREGROUND_FRESHNESS_MS): String? {
+        val now = System.currentTimeMillis()
+        memLastForeground?.let { (packageName, observedAt) ->
+            if (now - observedAt in 0..maxAgeMs) return packageName
+        }
         val observedAt = prefs.getLong("lastForegroundObservedAt", 0L)
         val observedBoot = prefs.getInt("lastForegroundBootCount", -1)
-        if (observedBoot != bootCount() || System.currentTimeMillis() - observedAt !in 0..maxAgeMs) {
+        if (observedBoot != bootCount() || now - observedAt !in 0..maxAgeMs) {
             return null
         }
         return prefs.getString("lastForeground", null)
@@ -185,10 +197,15 @@ class FallbackStateStore(context: Context) {
             .putInt("liveForegroundBootCount", bootCount())
             .putString("liveForegroundDay", dayKey)
             .apply()
+        memSessionObservedAt = startedAt
     }
 
     fun refreshLiveForegroundSession(observedAt: Long = System.currentTimeMillis()) {
         if (prefs.getString("liveForegroundPackage", null).isNullOrBlank()) return
+        memSessionObservedAt = observedAt
+        if (observedAt - prefs.getLong("liveForegroundLastObservedAt", 0L) < SESSION_OBSERVE_PERSIST_MS) {
+            return
+        }
         prefs.edit().putLong("liveForegroundLastObservedAt", observedAt).apply()
     }
 
@@ -199,12 +216,18 @@ class FallbackStateStore(context: Context) {
         val packageName = prefs.getString("liveForegroundPackage", null)?.takeIf { it.isNotBlank() }
             ?: return null
         val sessionDay = prefs.getString("liveForegroundDay", null) ?: return null
+        // The in-memory observation is fresher than the throttled prefs write; the
+        // overlay is always a past observation, so taking the max is monotone-safe.
+        val lastObservedAt = maxOf(
+            prefs.getLong("liveForegroundLastObservedAt", 0L),
+            memSessionObservedAt
+        )
         val session = LiveForegroundSession(
             packageName = packageName,
             startedAt = prefs.getLong("liveForegroundStartedAt", 0L),
             baselineUsageMs = prefs.getLong("liveForegroundBaselineMs", 0L),
             dayKey = sessionDay,
-            lastObservedAt = prefs.getLong("liveForegroundLastObservedAt", 0L),
+            lastObservedAt = lastObservedAt,
             bootCount = prefs.getInt("liveForegroundBootCount", -1)
         )
         if (session.dayKey != dayKey ||
@@ -222,7 +245,10 @@ class FallbackStateStore(context: Context) {
             ?: return
         val dayKey = prefs.getString("liveForegroundDay", null) ?: DateKeys.today()
         val startedAt = prefs.getLong("liveForegroundStartedAt", 0L)
-        val lastObservedAt = prefs.getLong("liveForegroundLastObservedAt", startedAt)
+        val lastObservedAt = maxOf(
+            prefs.getLong("liveForegroundLastObservedAt", startedAt),
+            memSessionObservedAt
+        )
         val baseline = prefs.getLong("liveForegroundBaselineMs", 0L)
         val endAt = minOf(now, lastObservedAt + OBSERVATION_GRACE_MS).coerceAtLeast(startedAt)
         val committed = baseline + (endAt - startedAt).coerceAtLeast(0L)
@@ -251,6 +277,7 @@ class FallbackStateStore(context: Context) {
     }
 
     private fun clearLiveForegroundSessionInternal() {
+        memSessionObservedAt = Long.MIN_VALUE
         prefs.edit()
             .remove("liveForegroundPackage")
             .remove("liveForegroundStartedAt")
@@ -268,9 +295,26 @@ class FallbackStateStore(context: Context) {
     }
 
     private fun bootCount(): Int {
+        bootCountCache.let { cached -> if (cached != Int.MIN_VALUE) return cached }
         return runCatching {
             Settings.Global.getInt(appContext.contentResolver, Settings.Global.BOOT_COUNT)
-        }.getOrDefault(0)
+        }.getOrDefault(0).also { bootCountCache = it }
+    }
+
+    fun pruneStaleKeys(retentionDays: Int = PRUNE_RETENTION_DAYS) {
+        val cutoffDay = DateKeys.daysAgo(retentionDays)
+        val now = System.currentTimeMillis()
+        val editor = prefs.edit()
+        var pruned = false
+        for (key in prefs.all.keys.toList()) {
+            when {
+                key.startsWith("usageLedger:") &&
+                    key.removePrefix("usageLedger:") < cutoffDay -> { editor.remove(key); pruned = true }
+                key.startsWith("unlock:") &&
+                    prefs.getLong(key, 0L) <= now -> { editor.remove(key); pruned = true }
+            }
+        }
+        if (pruned) editor.apply()
     }
 
     fun saveSafeMode(until: Long) {
@@ -299,7 +343,19 @@ class FallbackStateStore(context: Context) {
     companion object {
         const val FOREGROUND_FRESHNESS_MS = 3_000L
         private const val OBSERVATION_GRACE_MS = 1_500L
+        private const val LAST_FOREGROUND_PERSIST_MS = 30_000L
+        private const val SESSION_OBSERVE_PERSIST_MS = 30_000L
+        private const val PRUNE_RETENTION_DAYS = 7
         private const val MAX_PIN_DELAY_MS = 5 * 60_000L
+
+        // Both services share this process (no android:process split), so these
+        // overlays carry the per-event state; prefs persist it on a slow cadence
+        // for recovery after a process restart. Kept in the companion because
+        // each service constructs its own FallbackStateStore instance.
+        @Volatile private var memLastForeground: Pair<String, Long>? = null
+        @Volatile private var lastForegroundPersistedAt: Long = 0L
+        @Volatile private var memSessionObservedAt: Long = Long.MIN_VALUE
+        @Volatile private var bootCountCache: Int = Int.MIN_VALUE
 
         internal fun pinDelayMs(attempts: Int): Long = when {
             attempts <= 3 -> 1_000L

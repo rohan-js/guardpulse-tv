@@ -17,16 +17,45 @@ data class AppPolicy(
 class LocalPolicyStore(context: Context) {
     private val prefs = context.getSharedPreferences("local_policy", Context.MODE_PRIVATE)
 
+    // Read caches: loadPolicies() sits on the accessibility hot path (every event),
+    // so the full JSON map is parsed once and invalidated on any prefs write.
+    private val cacheLock = Any()
+    private var policiesCache: Map<String, AppPolicy>? = null
+    private var policiesJsonWritten: String? = null
+    private var dailyBlocksCache: Pair<String, Set<String>>? = null
+    private var usageOffsetsCache: Pair<String, Map<String, Long>>? = null
+
+    // Kept as a field: SharedPreferences holds listeners weakly, so the invalidator
+    // needs this strong reference to survive. Registered eagerly — any instance
+    // (accessibility service, sync service) may write while another reads.
+    private val cacheInvalidator = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+        synchronized(cacheLock) {
+            policiesCache = null
+            dailyBlocksCache = null
+            usageOffsetsCache = null
+        }
+    }
+
+    init {
+        prefs.registerOnSharedPreferenceChangeListener(cacheInvalidator)
+    }
+
     fun savePolicies(policies: Map<String, AppPolicy>) {
         val json = JSONObject()
         policies.forEach { (packageName, policy) -> json.put(packageName, policy.toJson()) }
-        prefs.edit().putString("policies", json.toString()).apply()
+        val serialized = json.toString()
+        if (serialized == policiesJsonWritten) return
+        prefs.edit().putString("policies", serialized).apply()
+        policiesJsonWritten = serialized
     }
 
     fun loadPolicies(): Map<String, AppPolicy> {
+        synchronized(cacheLock) {
+            policiesCache?.let { return it }
+        }
         val raw = prefs.getString("policies", null) ?: return emptyMap()
         val json = runCatching { JSONObject(raw) }.getOrNull() ?: return emptyMap()
-        return buildMap {
+        val parsed = buildMap {
             json.keys().forEach { packageName ->
                 val item = json.optJSONObject(packageName) ?: return@forEach
                 val limit = if (item.isNull("dailyLimitMinutes")) {
@@ -43,47 +72,72 @@ class LocalPolicyStore(context: Context) {
                 )
             }
         }
+        synchronized(cacheLock) { policiesCache = parsed }
+        return parsed
     }
 
     fun loadDailyLimitBlocks(): Set<String> {
-        return prefs.getStringSet("dailyBlocks:${DateKeys.today()}", emptySet()).orEmpty()
+        val key = "dailyBlocks:${DateKeys.today()}"
+        synchronized(cacheLock) {
+            dailyBlocksCache?.let { (cachedKey, cached) ->
+                if (cachedKey == key) return cached
+            }
+        }
+        val loaded = prefs.getStringSet(key, emptySet()).orEmpty()
+        synchronized(cacheLock) { dailyBlocksCache = key to loaded }
+        return loaded
     }
 
     fun markDailyLimitBlocked(packageName: String) {
         val key = "dailyBlocks:${DateKeys.today()}"
-        val updated = prefs.getStringSet(key, emptySet()).orEmpty().toMutableSet()
+        val updated = loadDailyLimitBlocks().toMutableSet()
         updated.add(packageName)
         prefs.edit().putStringSet(key, updated).apply()
+        synchronized(cacheLock) { dailyBlocksCache = key to updated }
     }
 
     fun clearDailyLimitBlocks(packageName: String? = null) {
         val key = "dailyBlocks:${DateKeys.today()}"
         if (packageName == null) {
             prefs.edit().remove(key).apply()
+            synchronized(cacheLock) { dailyBlocksCache = key to emptySet() }
         } else {
-            val updated = prefs.getStringSet(key, emptySet()).orEmpty().toMutableSet()
+            val updated = loadDailyLimitBlocks().toMutableSet()
             updated.remove(packageName)
             prefs.edit().putStringSet(key, updated).apply()
+            synchronized(cacheLock) { dailyBlocksCache = key to updated }
         }
     }
 
     fun loadUsageOffsetsMs(): Map<String, Long> {
         val day = DateKeys.today()
         val key = "usageOffsetsMs:$day"
+        synchronized(cacheLock) {
+            usageOffsetsCache?.let { (cachedKey, cached) ->
+                if (cachedKey == key) return cached
+            }
+        }
         val existing = prefs.getString(key, null)
-        if (existing != null) return parseLongMap(existing)
-
-        val legacy = prefs.getString("usageOffsets:$day", null) ?: return emptyMap()
-        val migrated = parseLongMap(legacy).mapValues { (_, minutes) -> minutes.coerceAtLeast(0L) * 60_000L }
-        saveLongMap(key, migrated)
-        return migrated
+        val loaded = if (existing != null) {
+            parseLongMap(existing)
+        } else {
+            val legacy = prefs.getString("usageOffsets:$day", null)
+                ?.let { parseLongMap(it) }
+                ?: emptyMap()
+            val migrated = legacy.mapValues { (_, minutes) -> minutes.coerceAtLeast(0L) * 60_000L }
+            if (legacy.isNotEmpty()) saveLongMap(key, migrated)
+            migrated
+        }
+        synchronized(cacheLock) { usageOffsetsCache = key to loaded }
+        return loaded
     }
 
     fun saveUsageOffsetMs(packageName: String, usageMs: Long) {
         val key = "usageOffsetsMs:${DateKeys.today()}"
-        val values = parseLongMap(prefs.getString(key, "{}") ?: "{}").toMutableMap()
+        val values = loadUsageOffsetsMs().toMutableMap()
         values[packageName] = usageMs.coerceAtLeast(0L)
         saveLongMap(key, values)
+        synchronized(cacheLock) { usageOffsetsCache = key to values }
     }
 
     private fun parseLongMap(raw: String): Map<String, Long> {
@@ -126,5 +180,25 @@ class LocalPolicyStore(context: Context) {
 
     fun unregisterChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener) {
         prefs.unregisterOnSharedPreferenceChangeListener(listener)
+    }
+
+    /** Removes day-keyed entries older than the retention window; called on service start. */
+    fun pruneStaleDays(retentionDays: Int = 7) {
+        val cutoffDay = DateKeys.daysAgo(retentionDays)
+        val editor = prefs.edit()
+        var pruned = false
+        for (key in prefs.all.keys.toList()) {
+            val dayKey = when {
+                key.startsWith("dailyBlocks:") -> key.removePrefix("dailyBlocks:")
+                key.startsWith("usageOffsetsMs:") -> key.removePrefix("usageOffsetsMs:")
+                key.startsWith("usageOffsets:") -> key.removePrefix("usageOffsets:")
+                else -> null
+            } ?: continue
+            if (dayKey < cutoffDay) {
+                editor.remove(key)
+                pruned = true
+            }
+        }
+        if (pruned) editor.apply()
     }
 }

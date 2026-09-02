@@ -24,13 +24,19 @@ class UsageTracker(private val context: Context) {
 
     fun rawUsageMillisToday(): Map<String, Long> {
         if (!hasUsageAccess()) return emptyMap()
+        val now = System.currentTimeMillis()
+        val today = DateKeys.today()
+        synchronized(rawCacheLock) {
+            if (today == rawCacheDay && now - rawCacheAt < RAW_USAGE_CACHE_TTL_MS) {
+                return rawCacheValue
+            }
+        }
         val start = Calendar.getInstance().apply {
             set(Calendar.HOUR_OF_DAY, 0)
             set(Calendar.MINUTE, 0)
             set(Calendar.SECOND, 0)
             set(Calendar.MILLISECOND, 0)
         }.timeInMillis
-        val now = System.currentTimeMillis()
         val stats = usageStatsManager.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, start, now)
         val usageByPackage = mutableMapOf<String, Long>()
         stats
@@ -39,7 +45,13 @@ class UsageTracker(private val context: Context) {
                 val packageName = canonicalUsagePackage(stat.packageName)
                 usageByPackage[packageName] = (usageByPackage[packageName] ?: 0L) + stat.totalTimeInForeground
             }
-        return usageByPackage
+        val result: Map<String, Long> = usageByPackage
+        synchronized(rawCacheLock) {
+            rawCacheDay = today
+            rawCacheAt = now
+            rawCacheValue = result
+        }
+        return result
     }
 
     fun effectiveUsageMillisToday(
@@ -65,6 +77,14 @@ class UsageTracker(private val context: Context) {
 
     companion object {
         private const val MILLIS_PER_MINUTE = 60_000L
+
+        // The system batches usage stats anyway; the live-session extrapolation in
+        // applyLiveForegroundSession keeps the effective number fresh between queries.
+        private const val RAW_USAGE_CACHE_TTL_MS = 30_000L
+        private val rawCacheLock = Any()
+        private var rawCacheDay: String? = null
+        private var rawCacheAt: Long = 0L
+        private var rawCacheValue: Map<String, Long> = emptyMap()
 
         internal fun applyLiveForegroundSession(
             baselineUsageMs: Map<String, Long>,

@@ -74,7 +74,6 @@ object PolicyConstants {
     const val TAMPER_PIN_RETRY_LOCKED = "pinRetryLocked"
 
     const val HEARTBEAT_INTERVAL_MS = 30_000L
-    const val USAGE_SCAN_INTERVAL_MS = 60_000L
     const val FOREGROUND_USAGE_UPLOAD_INTERVAL_MS = 10_000L
     const val FOREGROUND_USAGE_EXTRAPOLATION_MAX_MS = 20_000L
     const val PAIRING_TTL_MS = 10 * 60_000L

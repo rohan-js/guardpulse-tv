@@ -56,6 +56,25 @@ private data class ModePolicy(
     val appPolicies: Map<String, AppPolicy>
 )
 
+/**
+ * Expensive system probes (DPM binder calls, AppOps, Keystore PIN decrypt, VPN
+ * status refresh) captured once per TTL window and shared by the heartbeat and
+ * security-runtime uploads. Invalidated when the PIN or protection inputs are
+ * known to change.
+ */
+private data class ProbeSnapshot(
+    val mode: String?,
+    val deviceOwner: Boolean,
+    val adminActive: Boolean,
+    val adminSetupAvailable: Boolean,
+    val accessibility: Boolean,
+    val usageAccess: Boolean,
+    val vpnStatus: com.guardpulse.parentcontrol.tv.network.NetworkFilterStatus,
+    val backgroundUnrestricted: Boolean,
+    val pinConfigured: Boolean,
+    val pinHashVersion: Int
+)
+
 class TvSyncService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var deviceId: String
@@ -81,6 +100,19 @@ class TvSyncService : Service() {
     private var syncEngine: TvSyncEngine? = null
     private var firebaseConnected = false
     private var lastUsageWritePackage: String? = null
+    private var lastUsageWriteMs = 0L
+
+    // Last successfully uploaded payloads: diffing against these keeps idle ticks
+    // write-free. In-memory only — a process restart does one full re-upload.
+    private val lastUploadedStates = mutableMapOf<String, Any?>()
+    private val lastUploadedParentMirror = mutableMapOf<String, Any?>()
+    private val lastUploadedSecurityRuntime = mutableMapOf<String, Any?>()
+    private var lastUploadedInventoryPayload: Map<String, Map<String, Any?>>? = null
+    private var cachedInventory: List<TvInstalledApp>? = null
+    private val lastReportedSuspended = mutableSetOf<String>()
+    private val probeLock = Any()
+    private var probeCache: ProbeSnapshot? = null
+    private var probeCacheAt = 0L
     private val valueListeners = mutableListOf<Pair<Query, ValueEventListener>>()
     private val childListeners = mutableListOf<Pair<Query, ChildEventListener>>()
     private val retryFirebaseRunnable = Runnable {
@@ -105,6 +137,8 @@ class TvSyncService : Service() {
         activeModeName = localPolicyStore.activeModeName()
         safeModeUntil = localPolicyStore.safeModeUntil()
         fallbackStore.saveSafeMode(safeModeUntil)
+        fallbackStore.pruneStaleKeys()
+        localPolicyStore.pruneStaleDays()
 
         startForeground(NOTIFICATION_ID, buildNotification("Sync service starting"))
         policyController.applyHardening()
@@ -117,12 +151,16 @@ class TvSyncService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_RESCAN_APPS -> enqueueSyncWork("inventory") { awaitInventoryUpload() }
+            ACTION_RESCAN_APPS -> {
+                cachedInventory = null
+                enqueueSyncWork("inventory") { awaitInventoryUpload() }
+            }
             ACTION_RECONCILE -> enqueueSyncWork("state") { awaitPolicyReconciliation() }
             ACTION_FOREGROUND_CHANGED -> {
                 enqueueSyncWork("foreground") {
                     awaitPolicyReconciliation()
                     lastUsageWritePackage = fallbackStore.liveForegroundSession()?.packageName
+                    lastUsageWriteMs = 0L
                     updateSecurityRuntime()
                 }
             }
@@ -267,11 +305,16 @@ class TvSyncService : Service() {
         if (listenersAttached) return
         listenersAttached = true
         attachPairingListener()
-        attachPolicyListener()
-        attachModesListener()
-        attachActiveModeListener()
-        attachSafeModeListener()
-        attachSecurityListener()
+        // Legacy V1 policy/PIN listeners stream five subtrees whose handlers
+        // early-return once the V2 snapshot is active; attach them only when no
+        // local V2 snapshot exists.
+        if (!syncLocalStore.isV2Activated()) {
+            attachPolicyListener()
+            attachModesListener()
+            attachActiveModeListener()
+            attachSafeModeListener()
+            attachSecurityListener()
+        }
         attachCommandListener()
     }
 
@@ -384,6 +427,9 @@ class TvSyncService : Service() {
     private suspend fun onFirebaseReconnected(sessionId: String?): Boolean {
         val root = db ?: return false
         fallbackStore.saveServerTimeOffset(serverClock.offsetMillis())
+        // onDisconnect may have flipped the parent mirror offline server-side while
+        // we were away, so the next heartbeat must rewrite it in full.
+        lastUploadedParentMirror.clear()
         FirebaseAuth.getInstance().currentUser?.uid?.let(::registerDevice)
         val runtimeRef = root.child(FirebasePaths.deviceSyncRuntime(deviceId))
         runtimeRef.onDisconnect().updateChildren(
@@ -460,6 +506,7 @@ class TvSyncService : Service() {
         )
         saveEffectivePolicies()
         syncLocalStore.savePendingAppliedRevision(snapshot.revisionId)
+        invalidateProbeCache()
         db?.child(FirebasePaths.deviceSyncRuntime(deviceId))?.updateChildren(
             mapOf("lastPolicyReceivedAt" to ServerValue.TIMESTAMP)
         )
@@ -804,6 +851,7 @@ class TvSyncService : Service() {
                             )
                         )
                     }
+                    invalidateProbeCache()
                     updateSecurityRuntime()
                 }
 
@@ -903,8 +951,11 @@ class TvSyncService : Service() {
         packageName: String?
     ) {
         when (type) {
-            PolicyConstants.COMMAND_RESCAN_APPS -> uploadAppInventory { result ->
-                finishCommand(commandId, ref, result)
+            PolicyConstants.COMMAND_RESCAN_APPS -> {
+                cachedInventory = null
+                uploadAppInventory { result ->
+                    finishCommand(commandId, ref, result)
+                }
             }
             PolicyConstants.COMMAND_RESET_TODAY -> {
                 val currentUsage = usageTracker.effectiveUsageMillisToday(
@@ -981,16 +1032,23 @@ class TvSyncService : Service() {
     }
 
     private fun uploadAppInventory(onComplete: ((Result<Unit>) -> Unit)? = null) {
-        val apps = inventoryProvider.listLaunchableApps()
+        val apps = currentInventory()
         val payload = apps.associate { PackageKeys.encode(it.packageName) to it.toFirebaseMap() }
         val root = db ?: run {
             onComplete?.invoke(Result.failure(IllegalStateException("Firebase is unavailable")))
             applyPoliciesAndUpload(apps)
             return
         }
+        if (payload == lastUploadedInventoryPayload) {
+            // Identical to the last uploaded inventory; skip the full rewrite but
+            // still drive the policy reconciliation with the current app list.
+            applyPoliciesAndUpload(apps, onComplete = onComplete)
+            return
+        }
         root.child(FirebasePaths.deviceApps(deviceId)).setValue(payload)
             .addOnSuccessListener {
                 markChannelSynced("inventory")
+                lastUploadedInventoryPayload = payload
                 root.child(FirebasePaths.deviceSyncRuntime(deviceId)).updateChildren(
                     mapOf(
                         "inventoryRevision" to java.util.UUID.randomUUID().toString(),
@@ -1006,32 +1064,36 @@ class TvSyncService : Service() {
             }
     }
 
+    /**
+     * The launchable-app scan (two queryIntentActivities calls plus per-app
+     * metadata lookups) used to run on every 30s tick; it is cached per service
+     * lifetime and invalidated by explicit RESCAN triggers or package changes.
+     */
+    private fun currentInventory(): List<TvInstalledApp> {
+        cachedInventory?.let { return it }
+        return inventoryProvider.listLaunchableApps().also { cachedInventory = it }
+    }
+
     private fun updateHeartbeat() {
         fallbackStore.saveServerTimeOffset(serverClock.offsetMillis())
-        val mode = FallbackProtection.enforcementMode(this)
-        val adminSetupAvailable = FallbackProtection.isDeviceAdminSetupAvailable(this)
-        val accessibility = FallbackProtection.isAccessibilityEnabled(this)
-        val usageAccess = usageTracker.hasUsageAccess()
-        val vpnStatus = NetworkFilterController.refreshPreparedStatus(this)
-        val backgroundUnrestricted = BackgroundRestrictionStatus.isBatteryUnrestricted(this)
-        val pinConfigured = fallbackStore.loadPin() != null
+        val probes = currentProbes()
         val safeModeActive = fallbackStore.isSafeModeActive()
-        val protectionHealthy = mode == PolicyConstants.ENFORCEMENT_DEVICE_OWNER ||
-            ((!adminSetupAvailable || policyController.isAdminActive()) &&
-                accessibility &&
-                usageAccess &&
-                backgroundUnrestricted &&
-                pinConfigured)
+        val protectionHealthy = probes.mode == PolicyConstants.ENFORCEMENT_DEVICE_OWNER ||
+            ((!probes.adminSetupAvailable || probes.adminActive) &&
+                probes.accessibility &&
+                probes.usageAccess &&
+                probes.backgroundUnrestricted &&
+                probes.pinConfigured)
 
         val heartbeat = mapOf(
             "online" to true,
             "lastSeen" to ServerValue.TIMESTAMP,
-            "usageAccess" to usageAccess,
-            "vpnActive" to vpnStatus.active,
-            "vpnBlockedCount" to vpnStatus.blockedCount,
-            "backgroundUnrestricted" to backgroundUnrestricted,
-            "deviceOwner" to policyController.isDeviceOwner(),
-            "enforcementMode" to mode,
+            "usageAccess" to probes.usageAccess,
+            "vpnActive" to probes.vpnStatus.active,
+            "vpnBlockedCount" to probes.vpnStatus.blockedCount,
+            "backgroundUnrestricted" to probes.backgroundUnrestricted,
+            "deviceOwner" to probes.deviceOwner,
+            "enforcementMode" to probes.mode,
             "protectionHealthy" to protectionHealthy,
             "safeModeActive" to safeModeActive,
             "activeModeId" to activeModeId,
@@ -1054,88 +1116,129 @@ class TvSyncService : Service() {
                 recordSyncError(error.message ?: "Heartbeat upload failed", "heartbeat")
             }
         pairingManager.pairedParentUid()?.let { parentUid ->
-            db?.child(FirebasePaths.userDevice(parentUid, deviceId))?.updateChildren(
-                mapOf(
-                    "deviceId" to deviceId,
-                    "lastSeen" to ServerValue.TIMESTAMP,
-                    "online" to true,
-                    "enforcementMode" to mode,
-                    "protectionHealthy" to protectionHealthy
-                )
-            )?.addOnFailureListener { error ->
-                recordSyncError(error.message ?: "Parent heartbeat upload failed", "heartbeat")
+            val mirror = mapOf(
+                "deviceId" to deviceId,
+                "lastSeen" to ServerValue.TIMESTAMP,
+                "online" to true,
+                "enforcementMode" to probes.mode,
+                "protectionHealthy" to protectionHealthy
+            )
+            // Parent freshness derives from the mirror's lastSeen, so that field
+            // keeps refreshing every heartbeat; the rest only rewrites on change.
+            val changedMirror = mirror.filterKeys { it != "lastSeen" }
+                .filter { (key, value) -> lastUploadedParentMirror[key] != value }
+            if (lastUploadedParentMirror.isEmpty() || changedMirror.isNotEmpty()) {
+                db?.child(FirebasePaths.userDevice(parentUid, deviceId))?.updateChildren(mirror)
+                    ?.addOnSuccessListener {
+                        lastUploadedParentMirror.clear()
+                        lastUploadedParentMirror.putAll(mirror)
+                    }
+                    ?.addOnFailureListener { error ->
+                        recordSyncError(error.message ?: "Parent heartbeat upload failed", "heartbeat")
+                    }
+            } else {
+                db?.child(FirebasePaths.userDevice(parentUid, deviceId))
+                    ?.updateChildren(mapOf("lastSeen" to ServerValue.TIMESTAMP))
             }
-            db?.child(FirebasePaths.userDevice(parentUid, deviceId))
-                ?.onDisconnect()
-                ?.updateChildren(mapOf("online" to false, "lastSeen" to ServerValue.TIMESTAMP))
         }
         updateSecurityRuntime()
     }
 
     private fun updateSecurityRuntime() {
-        val adminActive = policyController.isAdminActive()
-        val adminSetupAvailable = FallbackProtection.isDeviceAdminSetupAvailable(this)
-        val accessibility = FallbackProtection.isAccessibilityEnabled(this)
-        val usage = usageTracker.hasUsageAccess()
-        val mode = FallbackProtection.enforcementMode(this)
-        val vpnStatus = NetworkFilterController.refreshPreparedStatus(this)
-        val backgroundUnrestricted = BackgroundRestrictionStatus.isBatteryUnrestricted(this)
-        val safeModeActive = fallbackStore.isSafeModeActive()
-        val pinRecord = fallbackStore.loadPin()
-        db?.child(FirebasePaths.deviceSecurityRuntime(deviceId))?.updateChildren(
-            mapOf(
-                "enforcementMode" to mode,
-                "deviceOwner" to policyController.isDeviceOwner(),
-                "deviceAdmin" to adminActive,
-                "deviceAdminSetupAvailable" to adminSetupAvailable,
-                "accessibility" to accessibility,
-                "usageAccess" to usage,
-                "vpnPrepared" to vpnStatus.prepared,
-                "vpnActive" to vpnStatus.active,
-                "vpnBlockedCount" to vpnStatus.blockedCount,
-                "vpnLastError" to vpnStatus.lastError,
-                "backgroundUnrestricted" to backgroundUnrestricted,
-                "pinConfigured" to (pinRecord != null),
-                "pinHashVersion" to (pinRecord?.version ?: 0),
-                "protectionHealthy" to (
-                    mode == PolicyConstants.ENFORCEMENT_DEVICE_OWNER ||
-                        ((adminActive || !adminSetupAvailable) &&
-                            accessibility &&
-                            usage &&
-                            backgroundUnrestricted &&
-                            pinRecord != null)
-                    ),
-                "lastForegroundPackage" to fallbackStore.lastForeground(),
-                "safeModeActive" to safeModeActive,
-                "safeModeUntil" to fallbackStore.safeModeUntil().takeIf { it > 0L },
-                "activeModeId" to activeModeId,
-                "activeModeName" to activeModeName,
-                "lastSyncError" to lastSyncError,
-                "updatedAt" to ServerValue.TIMESTAMP
-            )
-        )?.addOnSuccessListener {
-            markChannelSynced("health")
-            db?.child(FirebasePaths.deviceSyncRuntime(deviceId))?.updateChildren(
-                mapOf("lastHealthWriteAt" to ServerValue.TIMESTAMP, "lastSuccessAt" to ServerValue.TIMESTAMP)
-            )
-        }?.addOnFailureListener { error ->
-            recordSyncError(error.message ?: "Health upload failed", "health")
+        val probes = currentProbes()
+        val runtime = mapOf<String, Any?>(
+            "enforcementMode" to probes.mode,
+            "deviceOwner" to probes.deviceOwner,
+            "deviceAdmin" to probes.adminActive,
+            "deviceAdminSetupAvailable" to probes.adminSetupAvailable,
+            "accessibility" to probes.accessibility,
+            "usageAccess" to probes.usageAccess,
+            "vpnPrepared" to probes.vpnStatus.prepared,
+            "vpnActive" to probes.vpnStatus.active,
+            "vpnBlockedCount" to probes.vpnStatus.blockedCount,
+            "vpnLastError" to probes.vpnStatus.lastError,
+            "backgroundUnrestricted" to probes.backgroundUnrestricted,
+            "pinConfigured" to probes.pinConfigured,
+            "pinHashVersion" to probes.pinHashVersion,
+            "protectionHealthy" to (
+                probes.mode == PolicyConstants.ENFORCEMENT_DEVICE_OWNER ||
+                    ((probes.adminActive || !probes.adminSetupAvailable) &&
+                        probes.accessibility &&
+                        probes.usageAccess &&
+                        probes.backgroundUnrestricted &&
+                        probes.pinConfigured)
+                ),
+            "lastForegroundPackage" to fallbackStore.lastForeground(),
+            "safeModeActive" to fallbackStore.isSafeModeActive(),
+            "safeModeUntil" to fallbackStore.safeModeUntil().takeIf { it > 0L },
+            "activeModeId" to activeModeId,
+            "activeModeName" to activeModeName,
+            "lastSyncError" to lastSyncError
+        )
+        // Tamper reporting runs even when the upload below is skipped as unchanged.
+        uploadMissingProtectionEvents(probes)
+        if (lastUploadedSecurityRuntime.isNotEmpty() &&
+            TvStateDiff.changed(runtime, lastUploadedSecurityRuntime).isEmpty()
+        ) {
+            return
         }
-        uploadMissingProtectionEvents(adminActive, adminSetupAvailable, accessibility, usage, vpnStatus)
+        val payload = runtime + mapOf("updatedAt" to ServerValue.TIMESTAMP)
+        db?.child(FirebasePaths.deviceSecurityRuntime(deviceId))?.updateChildren(payload)
+            ?.addOnSuccessListener {
+                lastUploadedSecurityRuntime.clear()
+                lastUploadedSecurityRuntime.putAll(runtime)
+                markChannelSynced("health")
+                db?.child(FirebasePaths.deviceSyncRuntime(deviceId))?.updateChildren(
+                    mapOf("lastHealthWriteAt" to ServerValue.TIMESTAMP, "lastSuccessAt" to ServerValue.TIMESTAMP)
+                )
+            }?.addOnFailureListener { error ->
+                recordSyncError(error.message ?: "Health upload failed", "health")
+            }
     }
 
-    private fun uploadMissingProtectionEvents(
-        adminActive: Boolean,
-        adminSetupAvailable: Boolean,
-        accessibility: Boolean,
-        usageAccess: Boolean,
-        @Suppress("UNUSED_PARAMETER") vpnStatus: com.guardpulse.parentcontrol.tv.network.NetworkFilterStatus
-    ) {
-        if (policyController.isDeviceOwner()) return
+    /**
+     * Expensive protection probes (DPM binder calls, AppOps, Keystore PIN decrypt,
+     * VPN status) are captured once per TTL window and shared by the heartbeat and
+     * security-runtime paths. Invalidated when the PIN changes.
+     */
+    private fun currentProbes(): ProbeSnapshot {
+        synchronized(probeLock) {
+            probeCache?.takeIf { System.currentTimeMillis() - probeCacheAt < PROBE_CACHE_TTL_MS }
+                ?.let { return it }
+        }
+        val pinRecord = fallbackStore.loadPin()
+        val snapshot = ProbeSnapshot(
+            mode = FallbackProtection.enforcementMode(this),
+            deviceOwner = policyController.isDeviceOwner(),
+            adminActive = policyController.isAdminActive(),
+            adminSetupAvailable = FallbackProtection.isDeviceAdminSetupAvailable(this),
+            accessibility = FallbackProtection.isAccessibilityEnabled(this),
+            usageAccess = usageTracker.hasUsageAccess(),
+            vpnStatus = NetworkFilterController.refreshPreparedStatus(this),
+            backgroundUnrestricted = BackgroundRestrictionStatus.isBatteryUnrestricted(this),
+            pinConfigured = pinRecord != null,
+            pinHashVersion = pinRecord?.version ?: 0
+        )
+        synchronized(probeLock) {
+            probeCache = snapshot
+            probeCacheAt = System.currentTimeMillis()
+        }
+        return snapshot
+    }
+
+    private fun invalidateProbeCache() {
+        synchronized(probeLock) {
+            probeCache = null
+            probeCacheAt = 0L
+        }
+    }
+
+    private fun uploadMissingProtectionEvents(probes: ProbeSnapshot) {
+        if (probes.deviceOwner) return
         val missing = mutableListOf<String>()
-        if (adminSetupAvailable && !adminActive) missing += PolicyConstants.TAMPER_ADMIN_DISABLED
-        if (!accessibility) missing += PolicyConstants.TAMPER_ACCESSIBILITY_DISABLED
-        if (!usageAccess) missing += PolicyConstants.TAMPER_USAGE_ACCESS_MISSING
+        if (probes.adminSetupAvailable && !probes.adminActive) missing += PolicyConstants.TAMPER_ADMIN_DISABLED
+        if (!probes.accessibility) missing += PolicyConstants.TAMPER_ACCESSIBILITY_DISABLED
+        if (!probes.usageAccess) missing += PolicyConstants.TAMPER_USAGE_ACCESS_MISSING
         missing.forEach { type ->
             if (!fallbackStore.shouldReportTamper(type)) return@forEach
             TamperEventQueue.enqueue(
@@ -1147,7 +1250,7 @@ class TvSyncService : Service() {
     }
 
     private fun applyPoliciesAndUpload(
-        apps: List<TvInstalledApp> = inventoryProvider.listLaunchableApps(),
+        apps: List<TvInstalledApp> = currentInventory(),
         appliedRevision: SyncDesiredRevision? = null,
         applyGeneration: Long = 0L,
         onComplete: ((Result<Unit>) -> Unit)? = null
@@ -1237,9 +1340,19 @@ class TvSyncService : Service() {
                 lastError = "Protected package: ${app.protectedReason}"
             }
 
+            // DPM suspension polling is a binder call per app per tick; nothing in
+            // this process ever suspends (setSuspended has no callers), so only
+            // re-check apps previously reported as suspended.
+            val suspended = if (app.packageName in lastReportedSuspended) {
+                policyController.isSuspended(app.packageName).also { reported ->
+                    if (!reported) lastReportedSuspended.remove(app.packageName)
+                }
+            } else {
+                false
+            }
             states[PackageKeys.encode(app.packageName)] = mapOf(
                 "packageName" to app.packageName,
-                "suspended" to policyController.isSuspended(app.packageName),
+                "suspended" to suspended,
                 "requestedSuspended" to false,
                 "manualBlocked" to decision.manualBlocked,
                 "dailyLimitBlocked" to decision.dailyLimitBlocked,
@@ -1256,7 +1369,6 @@ class TvSyncService : Service() {
                 "usageMsToday" to usageMs,
                 "rawUsageMinutesToday" to appRawUsageMs / 60_000L,
                 "rawUsageMsToday" to appRawUsageMs,
-                "usageCapturedAt" to ServerValue.TIMESTAMP,
                 "foregroundActive" to (liveSession?.packageName == app.packageName),
                 "foregroundStartedAt" to liveSession
                     ?.takeIf { it.packageName == app.packageName }
@@ -1264,9 +1376,9 @@ class TvSyncService : Service() {
                 "controlRevisionId" to controlRevisionId,
                 "dailyLimitMinutes" to limit,
                 "blockable" to app.blockable,
-                "lastError" to lastError,
-                "updatedAt" to ServerValue.TIMESTAMP
+                "lastError" to lastError
             )
+            if (suspended) lastReportedSuspended.add(app.packageName)
         }
         PolicyConstants.deprecatedVirtualPolicyPackages.forEach { packageName ->
             states[PackageKeys.encode(packageName)] = null
@@ -1276,20 +1388,41 @@ class TvSyncService : Service() {
             onComplete?.invoke(Result.failure(IllegalStateException("Firebase is unavailable")))
             return
         }
-        val updates = mutableMapOf<String, Any?>()
-        states.forEach { (packageKey, value) ->
-            updates["${FirebasePaths.deviceStateApps(deviceId)}/$packageKey"] = value
-        }
-        updates["${FirebasePaths.deviceSyncRuntime(deviceId)}/lastStateWriteAt"] = ServerValue.TIMESTAMP
-        updates["${FirebasePaths.deviceSyncRuntime(deviceId)}/lastSuccessAt"] = ServerValue.TIMESTAMP
-        updates["${FirebasePaths.deviceSyncRuntime(deviceId)}/lastFailedChannel"] = null
-        updates["${FirebasePaths.deviceSyncRuntime(deviceId)}/lastError"] = null
-        updates["${FirebasePaths.deviceSyncRuntime(deviceId)}/lastErrorAt"] = null
         val appliedSessionId = syncEngine?.currentSessionId()
         val shouldAcknowledge = appliedRevision != null &&
             !appliedSessionId.isNullOrBlank() &&
             (applyGeneration == 0L ||
                 syncEngine?.isCurrent(applyGeneration, appliedRevision.revisionId) == true)
+
+        // Diff against the last successfully uploaded snapshot: at idle nothing
+        // changes, so the whole write is skipped. Timestamp sentinels are injected
+        // only into changed children — each still carries the full field set, so
+        // the strict rules .validate keeps passing without any rules changes.
+        val diffedStates = TvStateDiff.changed(states, lastUploadedStates)
+        if (diffedStates.isEmpty() && !shouldAcknowledge) {
+            markChannelSynced("state")
+            onComplete?.invoke(Result.success(Unit))
+            return
+        }
+        val updates = mutableMapOf<String, Any?>()
+        diffedStates.forEach { (packageKey, value) ->
+            val child = when (value) {
+                null -> null
+                is Map<*, *> -> value + mapOf(
+                    "usageCapturedAt" to ServerValue.TIMESTAMP,
+                    "updatedAt" to ServerValue.TIMESTAMP
+                )
+                else -> value
+            }
+            updates["${FirebasePaths.deviceStateApps(deviceId)}/$packageKey"] = child
+        }
+        if (diffedStates.isNotEmpty()) {
+            updates["${FirebasePaths.deviceSyncRuntime(deviceId)}/lastStateWriteAt"] = ServerValue.TIMESTAMP
+        }
+        updates["${FirebasePaths.deviceSyncRuntime(deviceId)}/lastSuccessAt"] = ServerValue.TIMESTAMP
+        updates["${FirebasePaths.deviceSyncRuntime(deviceId)}/lastFailedChannel"] = null
+        updates["${FirebasePaths.deviceSyncRuntime(deviceId)}/lastError"] = null
+        updates["${FirebasePaths.deviceSyncRuntime(deviceId)}/lastErrorAt"] = null
         if (shouldAcknowledge && appliedRevision != null) {
             updates[FirebasePaths.deviceSyncApplied(deviceId)] = mapOf(
                 "revisionId" to appliedRevision.revisionId,
@@ -1307,6 +1440,10 @@ class TvSyncService : Service() {
                         appliedSessionId
                     )
                     syncLocalStore.savePendingAppliedRevision(null)
+                }
+                if (diffedStates.isNotEmpty()) {
+                    lastUploadedStates.clear()
+                    lastUploadedStates.putAll(states)
                 }
                 markChannelSynced("state")
                 onComplete?.invoke(Result.success(Unit))
@@ -1347,6 +1484,17 @@ class TvSyncService : Service() {
         }
         val offsetMs = localPolicyStore.loadUsageOffsetsMs()[packageName] ?: 0L
         val usageMs = (rawUsageMs - offsetMs).coerceAtLeast(0L)
+        val now = System.currentTimeMillis()
+        if (packageName == lastUsageWritePackage &&
+            now - lastUsageWriteMs < USAGE_UPLOAD_MIN_DELTA_MS
+        ) {
+            // Same app still in front with less than the minimum accrued delta;
+            // the 30s state reconciliation keeps usageMsToday fresh anyway.
+            markChannelSynced("usage")
+            onComplete?.invoke(Result.success(Unit))
+            return
+        }
+        lastUsageWriteMs = now
         val statePath = FirebasePaths.deviceStateApp(deviceId, packageName)
         val updates = mutableMapOf<String, Any?>(
             "$statePath/usageMinutesToday" to usageMs / 60_000L,
@@ -1459,6 +1607,8 @@ class TvSyncService : Service() {
         private const val CHANNEL_ID = "tv_parental_control"
         private const val NOTIFICATION_ID = 1001
         private const val PAIR_REQUEST_RETENTION_MS = 7L * 24 * 60 * 60_000
+        private const val USAGE_UPLOAD_MIN_DELTA_MS = 30_000L
+        private const val PROBE_CACHE_TTL_MS = 5 * 60_000L
         private val TERMINAL_PAIR_STATUSES = setOf(
             PolicyConstants.PAIR_ACCEPTED,
             PolicyConstants.PAIR_REJECTED,
