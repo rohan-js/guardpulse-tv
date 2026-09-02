@@ -415,8 +415,28 @@ class TvSyncService : Service() {
     }
 
     private fun clearSyncError() {
+        val hadError = lastSyncError != null || syncLocalStore.lastError() != null
         lastSyncError = null
         syncLocalStore.saveLastError(null, null)
+        if (!hadError) return
+        // recordSyncError() pushes the failure to both runtime paths; mirror the
+        // null clears so the parent app stops showing a stale "Permission denied"
+        // the moment the TV is healthy again (the rules allow these fields to be
+        // absent, and the TV UID owns both nodes).
+        val root = db ?: return
+        root.child(FirebasePaths.deviceSecurityRuntime(deviceId)).updateChildren(
+            mapOf(
+                "lastSyncError" to null,
+                "updatedAt" to ServerValue.TIMESTAMP
+            )
+        )
+        root.child(FirebasePaths.deviceSyncRuntime(deviceId)).updateChildren(
+            mapOf(
+                "lastFailedChannel" to null,
+                "lastError" to null,
+                "lastErrorAt" to null
+            )
+        )
     }
 
     private fun markChannelSynced(channel: String) {
@@ -1265,8 +1285,12 @@ class TvSyncService : Service() {
         onComplete: ((Result<Unit>) -> Unit)? = null
     ) {
         expireSafeModeIfNeeded()
-        saveEffectivePolicies()
-        val policies = localPolicyStore.loadPolicies()
+        // Compute the effective map once and use that same map for every decision
+        // below; saveEffectivePolicies() persists the identical map for the
+        // enforcement readers. (A loadPolicies() round-trip here could observe a
+        // stale cache and recompute state from the pre-change policies.)
+        val policies = effectivePolicies()
+        saveEffectivePolicies(policies)
         val liveSession = fallbackStore.liveForegroundSession()
         val rawUsageMs = usageTracker.effectiveUsageMillisToday(
             liveSession,
@@ -1540,8 +1564,8 @@ class TvSyncService : Service() {
             }
     }
 
-    private fun saveEffectivePolicies() {
-        localPolicyStore.savePolicies(effectivePolicies())
+    private fun saveEffectivePolicies(policies: Map<String, AppPolicy> = effectivePolicies()) {
+        localPolicyStore.savePolicies(policies)
         localPolicyStore.saveActiveMode(activeModeId, activeModeName)
         localPolicyStore.saveSafeMode(safeModeUntil)
         fallbackStore.saveSafeMode(safeModeUntil)

@@ -19,9 +19,10 @@ class LocalPolicyStore(context: Context) {
 
     // Read caches: loadPolicies() sits on the accessibility hot path (every event),
     // so the full JSON map is parsed once and invalidated on any prefs write.
-    private val cacheLock = Any()
-    private var policiesCache: Map<String, AppPolicy>? = null
-    private var policiesJsonWritten: String? = null
+    // The day-keyed caches below are updated synchronously by their own writers;
+    // the policy cache lives at companion level (both services share one process),
+    // so savePolicies() can write it through without an async listener hop.
+    private val dayCacheLock = Any()
     private var dailyBlocksCache: Pair<String, Set<String>>? = null
     private var usageOffsetsCache: Pair<String, Map<String, Long>>? = null
 
@@ -29,8 +30,8 @@ class LocalPolicyStore(context: Context) {
     // needs this strong reference to survive. Registered eagerly — any instance
     // (accessibility service, sync service) may write while another reads.
     private val cacheInvalidator = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
-        synchronized(cacheLock) {
-            policiesCache = null
+        synchronized(policyCacheLock) { policiesCache = null }
+        synchronized(dayCacheLock) {
             dailyBlocksCache = null
             usageOffsetsCache = null
         }
@@ -44,13 +45,16 @@ class LocalPolicyStore(context: Context) {
         val json = JSONObject()
         policies.forEach { (packageName, policy) -> json.put(packageName, policy.toJson()) }
         val serialized = json.toString()
-        if (serialized == policiesJsonWritten) return
-        prefs.edit().putString("policies", serialized).apply()
-        policiesJsonWritten = serialized
+        synchronized(policyCacheLock) {
+            policiesCache = policies
+            if (serialized == policiesJsonWritten) return
+            prefs.edit().putString("policies", serialized).apply()
+            policiesJsonWritten = serialized
+        }
     }
 
     fun loadPolicies(): Map<String, AppPolicy> {
-        synchronized(cacheLock) {
+        synchronized(policyCacheLock) {
             policiesCache?.let { return it }
         }
         val raw = prefs.getString("policies", null) ?: return emptyMap()
@@ -72,19 +76,19 @@ class LocalPolicyStore(context: Context) {
                 )
             }
         }
-        synchronized(cacheLock) { policiesCache = parsed }
+        synchronized(policyCacheLock) { policiesCache = parsed }
         return parsed
     }
 
     fun loadDailyLimitBlocks(): Set<String> {
         val key = "dailyBlocks:${DateKeys.today()}"
-        synchronized(cacheLock) {
+        synchronized(dayCacheLock) {
             dailyBlocksCache?.let { (cachedKey, cached) ->
                 if (cachedKey == key) return cached
             }
         }
         val loaded = prefs.getStringSet(key, emptySet()).orEmpty()
-        synchronized(cacheLock) { dailyBlocksCache = key to loaded }
+        synchronized(dayCacheLock) { dailyBlocksCache = key to loaded }
         return loaded
     }
 
@@ -93,26 +97,26 @@ class LocalPolicyStore(context: Context) {
         val updated = loadDailyLimitBlocks().toMutableSet()
         updated.add(packageName)
         prefs.edit().putStringSet(key, updated).apply()
-        synchronized(cacheLock) { dailyBlocksCache = key to updated }
+        synchronized(dayCacheLock) { dailyBlocksCache = key to updated }
     }
 
     fun clearDailyLimitBlocks(packageName: String? = null) {
         val key = "dailyBlocks:${DateKeys.today()}"
         if (packageName == null) {
             prefs.edit().remove(key).apply()
-            synchronized(cacheLock) { dailyBlocksCache = key to emptySet() }
+            synchronized(dayCacheLock) { dailyBlocksCache = key to emptySet() }
         } else {
             val updated = loadDailyLimitBlocks().toMutableSet()
             updated.remove(packageName)
             prefs.edit().putStringSet(key, updated).apply()
-            synchronized(cacheLock) { dailyBlocksCache = key to updated }
+            synchronized(dayCacheLock) { dailyBlocksCache = key to updated }
         }
     }
 
     fun loadUsageOffsetsMs(): Map<String, Long> {
         val day = DateKeys.today()
         val key = "usageOffsetsMs:$day"
-        synchronized(cacheLock) {
+        synchronized(dayCacheLock) {
             usageOffsetsCache?.let { (cachedKey, cached) ->
                 if (cachedKey == key) return cached
             }
@@ -128,7 +132,7 @@ class LocalPolicyStore(context: Context) {
             if (legacy.isNotEmpty()) saveLongMap(key, migrated)
             migrated
         }
-        synchronized(cacheLock) { usageOffsetsCache = key to loaded }
+        synchronized(dayCacheLock) { usageOffsetsCache = key to loaded }
         return loaded
     }
 
@@ -137,7 +141,7 @@ class LocalPolicyStore(context: Context) {
         val values = loadUsageOffsetsMs().toMutableMap()
         values[packageName] = usageMs.coerceAtLeast(0L)
         saveLongMap(key, values)
-        synchronized(cacheLock) { usageOffsetsCache = key to values }
+        synchronized(dayCacheLock) { usageOffsetsCache = key to values }
     }
 
     private fun parseLongMap(raw: String): Map<String, Long> {
@@ -200,5 +204,17 @@ class LocalPolicyStore(context: Context) {
             }
         }
         if (pruned) editor.apply()
+    }
+
+    companion object {
+        // Policy cache is process-wide: TvSyncService (writer) and
+        // AppMonitorAccessibilityService (enforcement reader) each construct their
+        // own LocalPolicyStore but share one process and one prefs file. Keep the
+        // cache and the write-guard here so a save by one instance is immediately
+        // visible to a load on another — the async prefs listener is only a safety
+        // net for writes that bypass savePolicies().
+        private val policyCacheLock = Any()
+        private var policiesCache: Map<String, AppPolicy>? = null
+        private var policiesJsonWritten: String? = null
     }
 }
