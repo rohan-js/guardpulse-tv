@@ -424,6 +424,13 @@ class TvSyncService : Service() {
         if (syncLocalStore.dirtyChannels().isEmpty()) clearSyncError()
     }
 
+    /** Mirror flips to offline server-side if this TV dies without a clean disconnect. */
+    private fun registerParentMirrorOnDisconnect(parentUid: String) {
+        db?.child(FirebasePaths.userDevice(parentUid, deviceId))
+            ?.onDisconnect()
+            ?.updateChildren(mapOf("online" to false, "lastSeen" to ServerValue.TIMESTAMP))
+    }
+
     private suspend fun onFirebaseReconnected(sessionId: String?): Boolean {
         val root = db ?: return false
         fallbackStore.saveServerTimeOffset(serverClock.offsetMillis())
@@ -454,9 +461,7 @@ class TvSyncService : Service() {
             return false
         }
         pairingManager.pairedParentUid()?.let { parentUid ->
-            root.child(FirebasePaths.userDevice(parentUid, deviceId))
-                .onDisconnect()
-                .updateChildren(mapOf("online" to false, "lastSeen" to ServerValue.TIMESTAMP))
+            registerParentMirrorOnDisconnect(parentUid)
         }
         // The control/desired listeners will replay the newest matching revision.
         // Reconcile runtime state here without acknowledging a potentially stale cached revision.
@@ -618,6 +623,10 @@ class TvSyncService : Service() {
                                 ?.addOnSuccessListener {
                                     pairingManager.markPaired(parentUid)
                                     pairingManager.rotateCredentials()
+                                    // Pairing can complete mid-session, after the
+                                    // reconnect path already ran; without this the
+                                    // mirror has no offline sentinel on unclean death.
+                                    registerParentMirrorOnDisconnect(parentUid)
                                     Log.i(TAG, "Pairing completed")
                                 }
                                 ?.addOnFailureListener {
@@ -1398,7 +1407,9 @@ class TvSyncService : Service() {
         // changes, so the whole write is skipped. Timestamp sentinels are injected
         // only into changed children — each still carries the full field set, so
         // the strict rules .validate keeps passing without any rules changes.
-        val diffedStates = TvStateDiff.changed(states, lastUploadedStates)
+        // A fresh process uploads in full (including null deletions), because the
+        // in-memory snapshot starts empty and null-vs-missing diffs as unchanged.
+        val diffedStates = if (lastUploadedStates.isEmpty()) states else TvStateDiff.changed(states, lastUploadedStates)
         if (diffedStates.isEmpty() && !shouldAcknowledge) {
             markChannelSynced("state")
             onComplete?.invoke(Result.success(Unit))

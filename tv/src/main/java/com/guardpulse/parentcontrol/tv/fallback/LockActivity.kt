@@ -133,6 +133,7 @@ class LockActivity : Activity() {
         remoteUnlockButton = null
         keypadButtons.clear()
         render()
+        attachExistingUnlockRequestListener()
     }
 
     private fun detachRemoteListeners() {
@@ -524,7 +525,58 @@ class LockActivity : Activity() {
         }
     }
 
+    /**
+     * Re-arms remote unlock handling on every bind: this activity is the only
+     * consumer of unlock-request approvals, and HOME/re-bind cycles destroy the
+     * previous listener (onNewIntent → detachRemoteListeners). Without this, an
+     * approval that arrives after the kid left the lock screen is never applied.
+     */
+    private fun attachExistingUnlockRequestListener() {
+        val status = FirebaseBootstrap.initialize(this)
+        if (!status.configured) return
+        val auth = FirebaseAuth.getInstance()
+        if (auth.currentUser == null) {
+            auth.signInAnonymously().addOnSuccessListener { findExistingUnlockRequest() }
+            return
+        }
+        findExistingUnlockRequest()
+    }
+
+    private fun findExistingUnlockRequest() {
+        val deviceId = DeviceIdentity.getOrCreate(this)
+        FirebaseDatabase.getInstance().reference
+            .child(FirebasePaths.deviceUnlockRequests(deviceId))
+            .orderByChild("createdAt")
+            .limitToLast(20)
+            .addListenerForSingleValueEvent(object : ValueEventListener {
+                override fun onDataChange(snapshot: DataSnapshot) {
+                    val newest = snapshot.children
+                        .filter { child ->
+                            child.child("packageName").getValue(String::class.java) == packageNameToUnlock
+                        }
+                        .filter { child ->
+                            val status = child.child("status").getValue(String::class.java)
+                            status == PolicyConstants.UNLOCK_PENDING ||
+                                ApprovedUnlockPolicy.shouldApply(
+                                    status,
+                                    child.child("tvApplyStatus").getValue(String::class.java),
+                                    child.child("updatedAt").getValue(Long::class.java),
+                                    serverClock.now()
+                                )
+                        }
+                        .maxByOrNull { child ->
+                            child.child("createdAt").getValue(Long::class.java) ?: 0L
+                        }
+                        ?: return
+                    attachUnlockListener(newest.ref)
+                }
+
+                override fun onCancelled(error: DatabaseError) = Unit
+            })
+    }
+
     private fun attachUnlockListener(ref: DatabaseReference) {
+        detachRemoteListeners()
         val listener = object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
                 val status = snapshot.child("status").getValue(String::class.java)
