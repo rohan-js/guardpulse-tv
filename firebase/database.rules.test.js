@@ -621,3 +621,63 @@ test("runtime and request contracts reject unknown fields", async () => {
     })
   );
 });
+
+test("TV writes activity telemetry and the paired parent reads it", async () => {
+  await assertSucceeds(
+    dbAs("tvUid").ref("devices/tv1/activity/current").set({
+      runtimePackage: "com.google.android.youtube.tv",
+      packageName: "com.google.android.youtube.tv",
+      appLabel: "YouTube",
+      appStartedAt: 10,
+      overlayState: "none",
+      mediaAvailable: true,
+      mediaTitle: "Test video",
+      playbackState: "playing",
+      positionMs: 1000,
+      durationMs: 60000,
+      positionCapturedAt: 12,
+      playbackSpeed: 1,
+      updatedAt: 12,
+    })
+  );
+  await assertSucceeds(dbAs("parentUid").ref("devices/tv1/activity/current").get());
+  await assertFails(dbAs("otherParent").ref("devices/tv1/activity/current").get());
+  await assertFails(
+    dbAs("parentUid").ref("devices/tv1/activity/current").set({
+      packageName: "com.video",
+      appLabel: "Video",
+      appStartedAt: 10,
+      overlayState: "none",
+      updatedAt: 12,
+    })
+  );
+
+  await assertSucceeds(
+    dbAs("tvUid").ref("devices/tv1/activity/history/rec1").set({
+      type: "media",
+      packageName: "com.google.android.youtube.tv",
+      appLabel: "YouTube",
+      title: "Test video",
+      startedAt: 10,
+      endedAt: 70,
+      lastPositionMs: 60000,
+      durationMs: 60000,
+      playbackState: "paused",
+      confidence: "high",
+      updatedAt: 70,
+    })
+  );
+  await assertSucceeds(
+    dbAs("tvUid").ref("devices/tv1/activity/history/rec1").remove()
+  );
+  await assertFails(
+    dbAs("tvUid").ref("devices/tv1/activity/history/bad").set({
+      type: "other",
+      packageName: "com.video",
+      appLabel: "Video",
+      startedAt: 10,
+      endedAt: 70,
+      injected: true,
+    })
+  );
+});

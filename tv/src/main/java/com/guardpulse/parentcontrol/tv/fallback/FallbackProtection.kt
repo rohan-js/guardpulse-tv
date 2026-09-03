@@ -67,6 +67,20 @@ object FallbackProtection {
             return FallbackDecision(false)
         }
 
+        // Admin-disable gate: while a deactivation request is pending, any
+        // settings-package foreground re-locks. Unlocks granted via the PIN
+        // above still open it — the gate exists to stop pinless re-entry after
+        // pressing HOME away from the lock screen, not to trap the parent.
+        if (fallbackStore.isAdminChangePending() &&
+            foregroundPackage in PolicyConstants.primarySettingsPackages
+        ) {
+            return FallbackDecision(
+                locked = true,
+                reason = PolicyConstants.BLOCK_REASON_RISKY_SETTINGS,
+                policyPackage = foregroundPackage
+            )
+        }
+
         if (foregroundPackage in PolicyConstants.alwaysProtectedPackages &&
             foregroundPackage !in PolicyConstants.primarySettingsPackages
         ) {

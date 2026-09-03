@@ -7,7 +7,9 @@ data class AccessibilityTextNode(
 
 object MediaAccessibilityParser {
     private const val WINDOW_TITLE_VIEW_ID = "__window_title__"
-    private val supportedPackages = setOf(
+
+    /** Packages whose on-screen text the parser can turn into media metadata. */
+    val supportedPackages = setOf(
         "com.google.android.youtube.tv",
         "in.startv.hotstar"
     )

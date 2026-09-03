@@ -44,6 +44,8 @@ object FirebasePaths {
     fun deviceSecurityRuntime(deviceId: String) = "devices/$deviceId/security/runtime"
     fun deviceSecuritySafeMode(deviceId: String) = "devices/$deviceId/security/safeMode"
     fun deviceTamperEvents(deviceId: String) = "devices/$deviceId/tamperEvents"
+    fun deviceActivityCurrent(deviceId: String) = "devices/$deviceId/activity/current"
+    fun deviceActivityHistory(deviceId: String) = "devices/$deviceId/activity/history"
     fun deviceUnlockRequests(deviceId: String) = "devices/$deviceId/unlockRequests"
     fun deviceUnlockRequest(deviceId: String, requestId: String) =
         "devices/$deviceId/unlockRequests/$requestId"

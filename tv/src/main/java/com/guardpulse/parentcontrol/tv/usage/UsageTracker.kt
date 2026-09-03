@@ -7,7 +7,9 @@ import android.os.Process
 import com.guardpulse.parentcontrol.shared.DateKeys
 import com.guardpulse.parentcontrol.shared.PolicyConstants
 import com.guardpulse.parentcontrol.tv.fallback.LiveForegroundSession
+import com.guardpulse.parentcontrol.tv.system.SystemTimeGuard
 import java.util.Calendar
+import java.util.TimeZone
 
 class UsageTracker(private val context: Context) {
     private val usageStatsManager = context.getSystemService(UsageStatsManager::class.java)
@@ -25,13 +27,17 @@ class UsageTracker(private val context: Context) {
     fun rawUsageMillisToday(): Map<String, Long> {
         if (!hasUsageAccess()) return emptyMap()
         val now = System.currentTimeMillis()
-        val today = DateKeys.today()
+        val today = DateKeys.dayKeyUtc(SystemTimeGuard.now())
         synchronized(rawCacheLock) {
             if (today == rawCacheDay && now - rawCacheAt < RAW_USAGE_CACHE_TTL_MS) {
                 return rawCacheValue
             }
         }
-        val start = Calendar.getInstance().apply {
+        // Usage day = UTC day of the guarded clock, matching the day keys used by
+        // the local ledger and dailyBlocks; the query window starts at that day's
+        // UTC midnight so a timezone shift cannot reset the daily limit.
+        val start = Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply {
+            timeInMillis = SystemTimeGuard.now()
             set(Calendar.HOUR_OF_DAY, 0)
             set(Calendar.MINUTE, 0)
             set(Calendar.SECOND, 0)
@@ -63,7 +69,7 @@ class UsageTracker(private val context: Context) {
         committedUsageMs.forEach { (packageName, usageMs) ->
             baseline[packageName] = maxOf(baseline[packageName] ?: 0L, usageMs)
         }
-        return applyLiveForegroundSession(baseline, liveSession, now, DateKeys.today())
+        return applyLiveForegroundSession(baseline, liveSession, now, DateKeys.dayKeyUtc(SystemTimeGuard.now()))
     }
 
     fun usageMinutesToday(liveSession: LiveForegroundSession? = null): Map<String, Long> {

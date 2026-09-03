@@ -10,6 +10,7 @@ import com.guardpulse.parentcontrol.shared.ControlSnapshotV2
 import com.guardpulse.parentcontrol.shared.FirebasePaths
 import com.guardpulse.parentcontrol.shared.SyncDesiredRevision
 import java.util.UUID
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -46,7 +47,11 @@ class TvSyncEngine(
         data object RetryListeners : TvSyncEvent
     }
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val scope = CoroutineScope(
+        SupervisorJob() + Dispatchers.Main.immediate + CoroutineExceptionHandler { _, error ->
+            android.util.Log.e(TAG, "Engine coroutine failed", error)
+        }
+    )
     private val events = Channel<TvSyncEvent>(Channel.UNLIMITED)
     private val registrations = mutableListOf<Pair<DatabaseReference, ValueEventListener>>()
     private val pendingWork = mutableMapOf<String, suspend () -> Unit>()
@@ -59,10 +64,17 @@ class TvSyncEngine(
     private var reconcileJob: Job? = null
     private var retryJob: Job? = null
     private var started = false
+    private var settleRetries = 0
+    private var applyRetryDelayMs = INITIAL_RETRY_MS
 
     init {
         scope.launch {
-            for (event in events) handle(event)
+            for (event in events) {
+                // One poisoned event must never kill the loop — and with it the
+                // whole enforcement pipeline. Log and keep consuming.
+                runCatching { handle(event) }
+                    .onFailure { android.util.Log.e(TAG, "Sync event handling failed", it) }
+            }
         }
     }
 
@@ -127,8 +139,11 @@ class TvSyncEngine(
                     ControlProtocol.parse(event.snapshot)
                         .onSuccess { control ->
                             pendingSnapshot = control
-                            localStore.saveValidV2Snapshot(control)
                             localStore.activateV2(control.revisionId)
+                            // A freshly delivered control (new data from the
+                            // listener) deserves immediate retries again.
+                            settleRetries = 0
+                            applyRetryDelayMs = INITIAL_RETRY_MS
                             scheduleReconcile()
                         }
                         .onFailure { error ->
@@ -217,9 +232,20 @@ class TvSyncEngine(
             return
         }
         if (desired != null && desired.revisionId != control.revisionId) {
+            // The desired revision has not reached control/v2 yet (or points at
+            // something that will never land) — settle quickly a few times, then
+            // back off instead of hammering at 2 Hz forever.
             reconcileJob?.cancel()
+            val delayMs = if (settleRetries < SETTLE_RETRY_MAX) {
+                settleRetries++
+                REVISION_SETTLE_RETRY_MS
+            } else {
+                applyRetryDelayMs.also {
+                    applyRetryDelayMs = (it * 2).coerceAtMost(APPLY_RETRY_MAX_MS)
+                }
+            }
             reconcileJob = scope.launch {
-                delay(REVISION_SETTLE_RETRY_MS)
+                delay(delayMs)
                 events.send(TvSyncEvent.Reconcile)
             }
             return
@@ -230,11 +256,18 @@ class TvSyncEngine(
             localStore.lastAppliedSessionId() == sessionId &&
             localStore.pendingAppliedRevision() == null
         ) {
+            applyRetryDelayMs = INITIAL_RETRY_MS
+            settleRetries = 0
             return
         } else {
+            // Apply not confirmed yet (ack write failed / process died mid-apply)
+            // — re-dispatch with exponential backoff rather than every 5 seconds
+            // for the lifetime of the process.
             reconcileJob?.cancel()
+            val delayMs = applyRetryDelayMs
+            applyRetryDelayMs = (applyRetryDelayMs * 2).coerceAtMost(APPLY_RETRY_MAX_MS)
             reconcileJob = scope.launch {
-                delay(INITIAL_RETRY_MS)
+                delay(delayMs)
                 events.send(TvSyncEvent.Reconcile)
             }
         }
@@ -257,9 +290,12 @@ class TvSyncEngine(
     }
 
     companion object {
+        private const val TAG = "GuardPulseTvSync"
         private const val CONTROL_DEBOUNCE_MS = 250L
         private const val REVISION_SETTLE_RETRY_MS = 500L
         private const val INITIAL_RETRY_MS = 5_000L
         private const val MAX_RETRY_MS = 5 * 60_000L
+        private const val APPLY_RETRY_MAX_MS = 10 * 60_000L
+        private const val SETTLE_RETRY_MAX = 8
     }
 }

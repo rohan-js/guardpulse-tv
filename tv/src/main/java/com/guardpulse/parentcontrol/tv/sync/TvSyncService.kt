@@ -32,10 +32,12 @@ import com.guardpulse.parentcontrol.shared.PackageKeys
 import com.guardpulse.parentcontrol.shared.PolicyDecider
 import com.guardpulse.parentcontrol.shared.PolicyConstants
 import com.guardpulse.parentcontrol.shared.SyncDesiredRevision
+import com.guardpulse.parentcontrol.tv.activity.ActivityStore
 import com.guardpulse.parentcontrol.tv.MainActivity
 import com.guardpulse.parentcontrol.tv.R
 import com.guardpulse.parentcontrol.tv.apps.AppInventoryProvider
 import com.guardpulse.parentcontrol.tv.apps.TvInstalledApp
+import com.guardpulse.parentcontrol.tv.fallback.ApprovedUnlockPolicy
 import com.guardpulse.parentcontrol.tv.fallback.FallbackProtection
 import com.guardpulse.parentcontrol.tv.fallback.FallbackStateStore
 import com.guardpulse.parentcontrol.tv.fallback.PinRecord
@@ -45,6 +47,7 @@ import com.guardpulse.parentcontrol.tv.policy.AppPolicy
 import com.guardpulse.parentcontrol.tv.policy.DevicePolicyController
 import com.guardpulse.parentcontrol.tv.policy.LocalPolicyStore
 import com.guardpulse.parentcontrol.tv.system.BackgroundRestrictionStatus
+import com.guardpulse.parentcontrol.tv.system.SystemTimeGuard
 import com.guardpulse.parentcontrol.tv.usage.UsageTracker
 import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -91,6 +94,7 @@ class TvSyncService : Service() {
     private var startedFirebase = false
     private var listenersAttached = false
     private var authRetryDelayMs = 5_000L
+    private var listenerRetryDelayMs = 5_000L
     private var lastSyncError: String? = null
     private var basePolicies: Map<String, AppPolicy> = emptyMap()
     private var modes: Map<String, ModePolicy> = emptyMap()
@@ -101,6 +105,10 @@ class TvSyncService : Service() {
     private var firebaseConnected = false
     private var lastUsageWritePackage: String? = null
     private var lastUsageWriteMs = 0L
+    private var lastHardeningAt = 0L
+    private var lastUploadedActivityCurrent: Map<String, Any?>? = null
+    private var lastActivityDbPruneAt = 0L
+    private var activityStore: ActivityStore? = null
 
     // Last successfully uploaded payloads: diffing against these keeps idle ticks
     // write-free. In-memory only — a process restart does one full re-upload.
@@ -132,6 +140,8 @@ class TvSyncService : Service() {
         syncLocalStore = TvSyncLocalStore(this)
         serverClock = FirebaseServerClock()
         serverClock.start()
+        SystemTimeGuard.initialize(this)
+        SystemTimeGuard.setServerOffset(serverClock.offsetMillis())
         basePolicies = localPolicyStore.loadPolicies()
         activeModeId = localPolicyStore.activeModeId()
         activeModeName = localPolicyStore.activeModeName()
@@ -196,7 +206,14 @@ class TvSyncService : Service() {
         }
         auth.signInAnonymously()
             .addOnSuccessListener { result ->
-                val user = result.user ?: return@addOnSuccessListener
+                val user = result.user
+                if (user == null) {
+                    // Silent dead-end otherwise: sync never starts and nothing
+                    // records why. Retry with the same backoff as a failure.
+                    recordSyncError("Firebase anonymous sign-in returned no user")
+                    scheduleFirebaseRetry()
+                    return@addOnSuccessListener
+                }
                 onFirebaseReady(user)
             }
             .addOnFailureListener { error ->
@@ -273,7 +290,15 @@ class TvSyncService : Service() {
         appliedRevision: SyncDesiredRevision? = null
     ) {
         suspendCancellableCoroutine { continuation ->
-            applyPoliciesAndUpload(appliedRevision = appliedRevision) {
+            // A synchronous throw inside the upload must resume the awaiting
+            // coroutine (and surface a sync error) instead of wedging the loop.
+            runCatching {
+                applyPoliciesAndUpload(appliedRevision = appliedRevision) {
+                    if (continuation.isActive) continuation.resume(Unit)
+                }
+            }.onFailure { error ->
+                Log.e(TAG, "Policy reconciliation crashed", error)
+                recordSyncError(error.message ?: "Policy reconciliation crashed", "state")
                 if (continuation.isActive) continuation.resume(Unit)
             }
         }
@@ -281,7 +306,13 @@ class TvSyncService : Service() {
 
     private suspend fun awaitInventoryUpload() {
         suspendCancellableCoroutine { continuation ->
-            uploadAppInventory {
+            runCatching {
+                uploadAppInventory {
+                    if (continuation.isActive) continuation.resume(Unit)
+                }
+            }.onFailure { error ->
+                Log.e(TAG, "Inventory upload crashed", error)
+                recordSyncError(error.message ?: "Inventory upload crashed", "inventory")
                 if (continuation.isActive) continuation.resume(Unit)
             }
         }
@@ -289,7 +320,13 @@ class TvSyncService : Service() {
 
     private suspend fun awaitForegroundUsageUpload() {
         suspendCancellableCoroutine { continuation ->
-            uploadForegroundUsage {
+            runCatching {
+                uploadForegroundUsage {
+                    if (continuation.isActive) continuation.resume(Unit)
+                }
+            }.onFailure { error ->
+                Log.e(TAG, "Foreground usage upload crashed", error)
+                recordSyncError(error.message ?: "Foreground usage upload crashed", "usage")
                 if (continuation.isActive) continuation.resume(Unit)
             }
         }
@@ -304,7 +341,9 @@ class TvSyncService : Service() {
     private fun attachFirebaseListeners() {
         if (listenersAttached) return
         listenersAttached = true
+        listenerRetryDelayMs = 5_000L
         attachPairingListener()
+        attachUnlockRequestListener()
         // Legacy V1 policy/PIN listeners stream five subtrees whose handlers
         // early-return once the V2 snapshot is active; attach them only when no
         // local V2 snapshot exists.
@@ -318,6 +357,60 @@ class TvSyncService : Service() {
         attachCommandListener()
     }
 
+    /**
+     * Applies approved-but-unapplied unlock requests without requiring the lock
+     * screen to be alive: a kid leaving the lock screen (or the app being
+     * relaunched) must not orphan a parent approval. Idempotent with the
+     * LockActivity-side listener via the tvApplyStatus marker.
+     */
+    private fun attachUnlockRequestListener() {
+        val query = db!!.child(FirebasePaths.deviceUnlockRequests(deviceId))
+            .orderByChild("createdAt")
+            .limitToLast(20)
+        registerValueListener(query, object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                applyApprovedUnlockRequests(snapshot)
+            }
+
+            override fun onCancelled(error: DatabaseError) {
+                recordSyncError("Unlock requests listener cancelled: ${error.message}")
+            }
+        })
+    }
+
+    private fun applyApprovedUnlockRequests(snapshot: DataSnapshot) {
+        val now = SystemTimeGuard.now()
+        snapshot.children.forEach { child ->
+            val status = child.child("status").getValue(String::class.java)
+            val tvApplyStatus = child.child("tvApplyStatus").getValue(String::class.java)
+            val approvedAt = child.child("updatedAt").getValue(Long::class.java)
+            if (!ApprovedUnlockPolicy.shouldApply(status, tvApplyStatus, approvedAt, now)) {
+                return@forEach
+            }
+            val packageName = child.child("packageName").getValue(String::class.java)
+                ?: return@forEach
+            val approvalType = child.child("approvalType").getValue(String::class.java)
+                ?: PolicyConstants.UNLOCK_APPROVAL_ONE_VISIT
+            val approvalDurationMs = child.child("approvalDurationMs").getValue(Long::class.java)
+            val section = PolicyConstants.settingsSectionPolicy(packageName)
+            when {
+                section != null -> fallbackStore.grantSettingsSectionUnlock(section.key)
+                approvalType == PolicyConstants.UNLOCK_APPROVAL_TIMED &&
+                    approvalDurationMs != null && approvalDurationMs > 0 ->
+                    fallbackStore.grantTemporaryUnlock(packageName, approvalDurationMs)
+                else -> fallbackStore.grantAppVisitUnlock(packageName)
+            }
+            child.ref.updateChildren(
+                mapOf(
+                    "tvApplyStatus" to PolicyConstants.SYNC_STATUS_APPLIED,
+                    "tvAppliedAt" to ServerValue.TIMESTAMP
+                )
+            ).addOnFailureListener { error ->
+                recordSyncError(error.message ?: "Unlock apply marker failed", "state")
+            }
+        }
+    }
+
     private fun scheduleListenerRecovery() {
         handler.post {
             valueListeners.forEach { (ref, listener) -> ref.removeEventListener(listener) }
@@ -325,9 +418,11 @@ class TvSyncService : Service() {
             valueListeners.clear()
             childListeners.clear()
             listenersAttached = false
+            // Own backoff clock: sharing authRetryDelayMs let a couple of
+            // transient listener cancellations delay re-attach by minutes.
             handler.removeCallbacks(retryFirebaseRunnable)
-            handler.postDelayed({ attachFirebaseListeners() }, authRetryDelayMs)
-            authRetryDelayMs = (authRetryDelayMs * 2).coerceAtMost(5 * 60_000L)
+            handler.postDelayed({ attachFirebaseListeners() }, listenerRetryDelayMs)
+            listenerRetryDelayMs = (listenerRetryDelayMs * 2).coerceAtMost(5 * 60_000L)
         }
     }
 
@@ -550,15 +645,24 @@ class TvSyncService : Service() {
 
     private fun writeFailedRevision(revisionId: String?, error: String) {
         if (revisionId.isNullOrBlank()) return
+        val sessionId = syncEngine?.currentSessionId()
+        if (sessionId.isNullOrBlank()) {
+            // The rules require sessionId == sync/runtime/sessionId; without a
+            // session the write would be silently denied. The reconcile loop
+            // re-attempts once the session exists.
+            return
+        }
         db?.child(FirebasePaths.deviceSyncApplied(deviceId))?.setValue(
             mapOf(
                 "revisionId" to revisionId,
                 "status" to PolicyConstants.SYNC_STATUS_FAILED,
                 "appliedAt" to ServerValue.TIMESTAMP,
-                "sessionId" to syncEngine?.currentSessionId(),
-                "error" to error
+                "sessionId" to sessionId,
+                "error" to redactError(error)
             )
-        )
+        )?.addOnFailureListener { failure ->
+            recordSyncError(failure.message ?: "Failed-revision write error", "state")
+        }
     }
 
     private fun registerDevice(tvUid: String) {
@@ -945,7 +1049,10 @@ class TvSyncService : Service() {
                         return Transaction.abort()
                     }
                     currentData.child("status").value = PolicyConstants.COMMAND_RUNNING
-                    currentData.child("startedAt").value = serverClock.now()
+                    // The rules only accept `claimedAt` here (startedAt is not a
+                    // declared child and $other is false) — writing any other
+                    // field denies the whole claim transaction.
+                    currentData.child("claimedAt").value = serverClock.now()
                     currentData.child("sessionId").value = syncEngine?.currentSessionId()
                     return Transaction.success(currentData)
                 }
@@ -1045,7 +1152,7 @@ class TvSyncService : Service() {
         val updates = mutableMapOf<String, Any?>(
             "status" to if (result.isSuccess) PolicyConstants.COMMAND_DONE else PolicyConstants.COMMAND_FAILED,
             "completedAt" to ServerValue.TIMESTAMP,
-            "error" to result.exceptionOrNull()?.message
+            "error" to redactError(result.exceptionOrNull()?.message)
         )
         ref.updateChildren(updates)
             .addOnSuccessListener {
@@ -1078,6 +1185,7 @@ class TvSyncService : Service() {
             .addOnSuccessListener {
                 markChannelSynced("inventory")
                 lastUploadedInventoryPayload = payload
+                syncLocalStore.saveInventoryPackageKeys(payload.keys)
                 root.child(FirebasePaths.deviceSyncRuntime(deviceId)).updateChildren(
                     mapOf(
                         "inventoryRevision" to java.util.UUID.randomUUID().toString(),
@@ -1091,6 +1199,72 @@ class TvSyncService : Service() {
                 recordSyncError(error.message ?: "Inventory upload failed", "inventory")
                 onComplete?.invoke(Result.failure(error))
             }
+    }
+
+    /**
+     * Uploads the media-activity telemetry produced by the accessibility
+     * service: the current snapshot (only when it changed) plus pending closed
+     * session rows in small batches. Cheap by design — most heartbeat cycles
+     * write nothing at all.
+     */
+    private fun uploadActivityTelemetry() {
+        val root = db ?: return
+        val store = activityStore ?: ActivityStore(this).also { activityStore = it }
+        runCatching {
+            val pending = store.pendingHistory(limit = 10)
+            if (pending.isNotEmpty()) {
+                val updates = mutableMapOf<String, Any?>()
+                pending.forEach { record ->
+                    updates["${FirebasePaths.deviceActivityHistory(deviceId)}/${record.id}"] =
+                        record.toFirebaseMap()
+                }
+                root.updateChildren(updates)
+                    .addOnSuccessListener {
+                        pending.forEach { store.markUploaded(it.id) }
+                        markChannelSynced("activity")
+                    }
+                    .addOnFailureListener { error ->
+                        recordSyncError(error.message ?: "Activity history upload failed", "activity")
+                    }
+            }
+            store.current()?.let { snapshot ->
+                val payload = snapshot.toFirebaseMap()
+                if (payload != lastUploadedActivityCurrent) {
+                    root.child(FirebasePaths.deviceActivityCurrent(deviceId))
+                        .setValue(payload)
+                        .addOnSuccessListener {
+                            lastUploadedActivityCurrent = payload
+                            markChannelSynced("activity")
+                        }
+                        .addOnFailureListener { error ->
+                            recordSyncError(error.message ?: "Activity current upload failed", "activity")
+                        }
+                }
+            }
+            if (SystemTimeGuard.now() - lastActivityDbPruneAt > ACTIVITY_DB_PRUNE_INTERVAL_MS) {
+                lastActivityDbPruneAt = SystemTimeGuard.now()
+                val cutoff = (SystemTimeGuard.now() - ACTIVITY_RETENTION_MS).toDouble()
+                root.child(FirebasePaths.deviceActivityHistory(deviceId))
+                    .orderByChild("startedAt")
+                    .endAt(cutoff)
+                    .addListenerForSingleValueEvent(object : ValueEventListener {
+                        override fun onDataChange(snapshot: DataSnapshot) {
+                            val deletions = mutableMapOf<String, Any?>()
+                            snapshot.children.forEach { child ->
+                                child.key?.let { deletions[it] = null }
+                            }
+                            if (deletions.isNotEmpty()) {
+                                root.child(FirebasePaths.deviceActivityHistory(deviceId))
+                                    .updateChildren(deletions)
+                            }
+                        }
+
+                        override fun onCancelled(error: DatabaseError) = Unit
+                    })
+            }
+        }.onFailure { error ->
+            Log.w(TAG, "Activity telemetry upload failed", error)
+        }
     }
 
     /**
@@ -1416,6 +1590,11 @@ class TvSyncService : Service() {
         PolicyConstants.deprecatedVirtualPolicyPackages.forEach { packageName ->
             states[PackageKeys.encode(packageName)] = null
         }
+        // Uninstalled packages would otherwise leave stale state children in the
+        // DB forever: diff against the persisted inventory key set and emit
+        // explicit deletions for anything that disappeared since the last scan.
+        val removedKeys = syncLocalStore.inventoryPackageKeys() - states.keys
+        removedKeys.forEach { key -> states[key] = null }
 
         val root = db ?: run {
             onComplete?.invoke(Result.failure(IllegalStateException("Firebase is unavailable")))
@@ -1574,10 +1753,22 @@ class TvSyncService : Service() {
     private fun effectivePolicies(): Map<String, AppPolicy> {
         val modeId = activeModeId
         val activeMode = if (modeId.isNullOrBlank()) null else modes[modeId]
-        if (activeMode == null) return basePolicies
-        val merged = activeMode.appPolicies.toMutableMap()
+        // Without device-owner hardening there is no DPM uninstall block or
+        // DISALLOW_APPS_CONTROL, so the Settings app itself is default-locked:
+        // a package-level lock that does not depend on section-text detection,
+        // taking the locale-switch and uninstall-reach escape surfaces with it.
+        // An explicit parent allow (Settings toggled on) still wins via
+        // putIfAbsent, and the per-visit PIN keeps the parent's own access.
+        val settingsDefaultLock = FallbackProtection.enforcementMode(this) !=
+            PolicyConstants.ENFORCEMENT_DEVICE_OWNER
+        val merged = (activeMode?.appPolicies ?: basePolicies).toMutableMap()
         PolicyConstants.defaultLockedPackages.forEach { packageName ->
             merged.putIfAbsent(packageName, AppPolicy(manualBlocked = true))
+        }
+        if (settingsDefaultLock) {
+            PolicyConstants.primarySettingsPackages.forEach { packageName ->
+                merged.putIfAbsent(packageName, AppPolicy(manualBlocked = true))
+            }
         }
         return merged
     }
@@ -1592,10 +1783,19 @@ class TvSyncService : Service() {
 
     private val tickRunnable = object : Runnable {
         override fun run() {
-            policyController.applyHardening()
+            SystemTimeGuard.setServerOffset(serverClock.offsetMillis())
+            // 7-8 DPM binder calls per pass; every 30 s on a low-end TV is
+            // jank risk for no benefit. ~5 minutes is plenty for drift
+            // correction, and the accessibility/usage inputs are monitored
+            // by the probes the heartbeat path already uses.
+            if (System.currentTimeMillis() - lastHardeningAt >= HARDENING_INTERVAL_MS) {
+                lastHardeningAt = System.currentTimeMillis()
+                policyController.applyHardening()
+            }
             enqueueSyncWork("heartbeat-cycle") {
                 awaitPolicyReconciliation()
                 updateHeartbeat()
+                uploadActivityTelemetry()
             }
             handler.postDelayed(this, PolicyConstants.HEARTBEAT_INTERVAL_MS)
         }
@@ -1644,6 +1844,9 @@ class TvSyncService : Service() {
         private const val PAIR_REQUEST_RETENTION_MS = 7L * 24 * 60 * 60_000
         private const val USAGE_UPLOAD_MIN_DELTA_MS = 30_000L
         private const val PROBE_CACHE_TTL_MS = 5 * 60_000L
+        private const val HARDENING_INTERVAL_MS = 5 * 60_000L
+        private const val ACTIVITY_RETENTION_MS = 7L * 24 * 60 * 60_000
+        private const val ACTIVITY_DB_PRUNE_INTERVAL_MS = 24L * 60 * 60_000
         private val TERMINAL_PAIR_STATUSES = setOf(
             PolicyConstants.PAIR_ACCEPTED,
             PolicyConstants.PAIR_REJECTED,

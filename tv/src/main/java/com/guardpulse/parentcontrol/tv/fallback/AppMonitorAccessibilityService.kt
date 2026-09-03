@@ -7,7 +7,12 @@ import android.os.Looper
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.guardpulse.parentcontrol.shared.PolicyConstants
+import com.guardpulse.parentcontrol.tv.activity.MediaAccessibilityParser
+import com.guardpulse.parentcontrol.tv.activity.MediaBrowserProbe
+import com.guardpulse.parentcontrol.tv.activity.PlaybackAudioMonitor
+import com.guardpulse.parentcontrol.tv.activity.TvActivityTracker
 import com.guardpulse.parentcontrol.tv.policy.LocalPolicyStore
+import com.guardpulse.parentcontrol.tv.system.SystemTimeGuard
 import com.guardpulse.parentcontrol.tv.system.TvServiceStarter
 import com.guardpulse.parentcontrol.tv.sync.TvSyncService
 import com.guardpulse.parentcontrol.tv.sync.TamperEventQueue
@@ -22,6 +27,12 @@ class AppMonitorAccessibilityService : AccessibilityService() {
     private var lastLiveLimitCheckPackage: String? = null
     @Volatile private var lastEventHandledAt = 0L
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    private var activityTracker: TvActivityTracker? = null
+    private var audioMonitor: PlaybackAudioMonitor? = null
+    private var mediaBrowserProbe: MediaBrowserProbe? = null
+    private var lastNodeWalkAt = 0L
+
     private val foregroundPollRunnable = object : Runnable {
         override fun run() {
             // Events keep the foreground evaluation warm; the poll is only a
@@ -32,6 +43,14 @@ class AppMonitorAccessibilityService : AccessibilityService() {
             mainHandler.postDelayed(this, FOREGROUND_RECHECK_MS)
         }
     }
+
+    // A TYPE_WINDOW_STATE_CHANGED frequently arrives before the new window's
+    // nodes are queryable, and the event path is subject to the poll grace —
+    // together that leaves up to ~2.5 s of undetected window transition, enough
+    // to start a toggle flow inside a locked settings section. A one-shot
+    // re-evaluate 300 ms out closes the gap regardless of event flow.
+    private val windowSettleRunnable = Runnable { evaluateCurrentWindow() }
+
     private val policyChangeListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         if (key == "policies" ||
             key == "safeModeUntil" ||
@@ -44,17 +63,36 @@ class AppMonitorAccessibilityService : AccessibilityService() {
     }
 
     override fun onServiceConnected() {
+        SystemTimeGuard.initialize(this)
         localPolicyStore = LocalPolicyStore(this)
         fallbackStore = FallbackStateStore(this)
         usageTracker = UsageTracker(this)
         localPolicyStore.registerChangeListener(policyChangeListener)
         runCatching { TvServiceStarter.start(this) }
+        activityTracker = TvActivityTracker(this)
+        audioMonitor = PlaybackAudioMonitor(this, { isPlaying ->
+            val foreground = fallbackStore.lastForeground()
+            if (foreground != null) {
+                runCatching {
+                    activityTracker?.observeAudioPlayback(foreground, isPlaying)
+                }
+            }
+        }).also { monitor -> runCatching { monitor.start() } }
+        mediaBrowserProbe = MediaBrowserProbe(this) { runtimePackage, title, subtitle, playbackState, positionMs, durationMs ->
+            runCatching {
+                activityTracker?.observeMediaBrowser(runtimePackage, title, subtitle, playbackState, positionMs, durationMs)
+            }
+        }
         mainHandler.post(foregroundPollRunnable)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val packageName = event?.packageName?.toString() ?: return
         if (!::localPolicyStore.isInitialized) return
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            mainHandler.removeCallbacks(windowSettleRunnable)
+            mainHandler.postDelayed(windowSettleRunnable, WINDOW_SETTLE_RECHECK_MS)
+        }
         evaluateForeground(
             packageName = packageName,
             eventClassName = event.className,
@@ -114,7 +152,10 @@ class AppMonitorAccessibilityService : AccessibilityService() {
             settingsSection = settingsSection
         )
         val now = System.currentTimeMillis()
-        val launch = lockLaunchGuard.evaluate(packageName, decision, now) ?: return
+        val launch = lockLaunchGuard.evaluate(packageName, decision, now) ?: run {
+            trackActivity(packageName, eventClassName, eventText, root)
+            return
+        }
         if (decision.reason == PolicyConstants.BLOCK_REASON_RISKY_SETTINGS ||
             decision.reason == PolicyConstants.BLOCK_REASON_SETTINGS_SECTION
         ) {
@@ -128,12 +169,39 @@ class AppMonitorAccessibilityService : AccessibilityService() {
         )
     }
 
+    /**
+     * Media-activity tracking rides the same evaluation pass. The node-tree
+     * walk is the only expensive part, so it is rate-limited and restricted to
+     * packages the parser actually understands; everything else updates the
+     * current-app session cheaply.
+     */
+    private fun trackActivity(
+        packageName: String,
+        eventClassName: CharSequence?,
+        eventText: List<CharSequence>,
+        root: AccessibilityNodeInfo?
+    ) {
+        val tracker = activityTracker ?: return
+        runCatching {
+            val now = System.currentTimeMillis()
+            if (packageName in MediaAccessibilityParser.supportedPackages &&
+                now - lastNodeWalkAt >= MEDIA_NODE_WALK_MIN_INTERVAL_MS
+            ) {
+                lastNodeWalkAt = now
+                tracker.observe(packageName, eventClassName, eventText, emptyList(), root)
+            } else {
+                tracker.observePackageOnly(packageName)
+            }
+        }
+    }
+
     private fun trackLiveForeground(packageName: String) {
         val usagePackage = usagePolicyPackage(packageName)
         val current = fallbackStore.liveForegroundSession()
         if (usagePackage == null) {
             if (current != null) {
                 fallbackStore.finalizeLiveForegroundSession()
+                disconnectMediaBrowserProbe()
                 runCatching { TvServiceStarter.start(this, TvSyncService.ACTION_FOREGROUND_CHANGED) }
             }
             return
@@ -144,7 +212,16 @@ class AppMonitorAccessibilityService : AccessibilityService() {
         }
         val baselineMs = usageTracker.rawUsageMillisToday()[usagePackage] ?: 0L
         fallbackStore.startLiveForegroundSession(usagePackage, baselineMs)
+        connectMediaBrowserProbe(packageName)
         runCatching { TvServiceStarter.start(this, TvSyncService.ACTION_FOREGROUND_CHANGED) }
+    }
+
+    private fun connectMediaBrowserProbe(runtimePackage: String) {
+        runCatching { mediaBrowserProbe?.connect(runtimePackage) }
+    }
+
+    private fun disconnectMediaBrowserProbe() {
+        runCatching { mediaBrowserProbe?.disconnect() }
     }
 
     private fun enforceLiveDailyLimit(
@@ -209,6 +286,8 @@ class AppMonitorAccessibilityService : AccessibilityService() {
         if (::localPolicyStore.isInitialized) {
             localPolicyStore.unregisterChangeListener(policyChangeListener)
         }
+        runCatching { audioMonitor?.stop() }
+        disconnectMediaBrowserProbe()
         mainHandler.removeCallbacksAndMessages(null)
         super.onDestroy()
     }
@@ -228,5 +307,7 @@ class AppMonitorAccessibilityService : AccessibilityService() {
         private const val FOREGROUND_RECHECK_MS = 1_000L
         private const val LIVE_LIMIT_CHECK_MS = 5_000L
         private const val POLL_EVENT_GRACE_MS = 1_500L
+        private const val WINDOW_SETTLE_RECHECK_MS = 300L
+        private const val MEDIA_NODE_WALK_MIN_INTERVAL_MS = 750L
     }
 }

@@ -11,6 +11,7 @@ object PolicyConstants {
     const val TV_PACKAGE = "com.guardpulse.parentcontrol.tv"
     const val PARENT_PACKAGE = "com.guardpulse.parentcontrol.parent"
     const val SETTINGS_APPS_PACKAGE = "com.guardpulse.policy.settings_apps"
+    const val SETTINGS_DEVICE_PREFERENCES_PACKAGE = "com.guardpulse.policy.settings_device_preferences"
     const val SETTINGS_DEVELOPER_OPTIONS_PACKAGE = "com.guardpulse.policy.settings_developer_options"
     const val SETTINGS_SECURITY_RESTRICTIONS_PACKAGE = "com.guardpulse.policy.settings_security_restrictions"
     const val SETTINGS_ACCESSIBILITY_PACKAGE = "com.guardpulse.policy.settings_accessibility"
@@ -111,6 +112,12 @@ object PolicyConstants {
             label = "Settings: Apps",
             shortLabel = "Apps",
             key = "settings-apps"
+        ),
+        SettingsSectionPolicy(
+            packageName = SETTINGS_DEVICE_PREFERENCES_PACKAGE,
+            label = "Settings: Device Preferences",
+            shortLabel = "Device Preferences",
+            key = "settings-device-preferences"
         ),
         SettingsSectionPolicy(
             packageName = SETTINGS_DEVELOPER_OPTIONS_PACKAGE,

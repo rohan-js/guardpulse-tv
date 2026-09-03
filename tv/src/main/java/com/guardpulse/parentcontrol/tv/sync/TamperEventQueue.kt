@@ -36,7 +36,17 @@ object TamperEventQueue {
         if (!FirebaseRuntime.initialize(appContext).configured || flushing) return
         val auth = FirebaseAuth.getInstance()
         if (auth.currentUser == null) {
-            auth.signInAnonymously().addOnSuccessListener { flush(appContext) }
+            auth.signInAnonymously()
+                .addOnSuccessListener { flush(appContext) }
+                .addOnFailureListener { error ->
+                    // Events stay persisted; retry once after a delay instead of
+                    // stalling until the next enqueue/reconnect.
+                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
+                        { flush(appContext) },
+                        SIGN_IN_RETRY_DELAY_MS
+                    )
+                    android.util.Log.w("GuardPulseTamper", "Tamper sign-in failed", error)
+                }
             return
         }
         val next = synchronized(this) { load(appContext).firstOrNull() } ?: return
@@ -66,8 +76,13 @@ object TamperEventQueue {
                 flushing = false
                 flush(appContext)
             }
-            .addOnFailureListener {
+            .addOnFailureListener { error ->
                 flushing = false
+                android.util.Log.w("GuardPulseTamper", "Tamper upload failed; will retry", error)
+                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
+                    { flush(appContext) },
+                    SIGN_IN_RETRY_DELAY_MS
+                )
             }
     }
 
@@ -112,4 +127,6 @@ object TamperEventQueue {
         val message: String,
         val createdAt: Long
     )
+
+    private const val SIGN_IN_RETRY_DELAY_MS = 60_000L
 }

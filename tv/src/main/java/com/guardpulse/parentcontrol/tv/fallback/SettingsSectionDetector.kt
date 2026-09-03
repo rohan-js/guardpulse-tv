@@ -126,7 +126,13 @@ object SettingsSectionDetector {
                 return sectionFor(packageName)
             }
         }
-        if (isDevicePreferencesMenu(windowInput)) return null
+        // The Device Preferences menu contains Language / Date & Time / Keyboard —
+        // rows with no dedicated protection and the entry points for locale and
+        // clock tampering. The whole menu is now a default-locked section instead
+        // of a deliberate blind spot.
+        if (isDevicePreferencesMenu(windowInput)) {
+            return sectionFor(PolicyConstants.SETTINGS_DEVICE_PREFERENCES_PACKAGE)
+        }
         protectedDevicePreferenceRows.forEach { (rowText, packageName) ->
             if (rowText in windowInput) {
                 return sectionFor(packageName)

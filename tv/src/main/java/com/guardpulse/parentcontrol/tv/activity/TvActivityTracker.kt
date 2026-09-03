@@ -11,6 +11,23 @@ class TvActivityTracker(private val context: Context) {
     private var pendingMediaSignature: String? = null
     private var pendingMediaCount = 0
 
+    // Events arrive at high frequency on the accessibility thread; re-parsing
+    // the JSON prefs snapshot per event is pure waste when nothing changed.
+    // The in-memory mirror is written on every persist and reloaded after a
+    // process restart.
+    @Volatile
+    private var memCurrent: ActivitySnapshot? = null
+
+    private fun loadCurrent(): ActivitySnapshot? {
+        memCurrent?.let { return it }
+        return store.current()?.also { memCurrent = it }
+    }
+
+    private fun persistCurrent(snapshot: ActivitySnapshot) {
+        memCurrent = snapshot
+        store.saveCurrent(snapshot)
+    }
+
     fun observe(
         runtimePackage: String,
         eventClassName: CharSequence?,
@@ -19,7 +36,7 @@ class TvActivityTracker(private val context: Context) {
         root: AccessibilityNodeInfo?
     ): Boolean {
         val now = System.currentTimeMillis()
-        val current = store.current()
+        val current = loadCurrent()
         if (runtimePackage == "com.android.systemui") return false
         if (runtimePackage == context.packageName) {
             if (current == null) return false
@@ -27,7 +44,7 @@ class TvActivityTracker(private val context: Context) {
                 eventClassName?.toString() == LockActivity::class.java.name
             if (!lockClass && current.overlayState == ActivitySnapshot.OVERLAY_LOCKED) return false
             if (current.overlayState == ActivitySnapshot.OVERLAY_LOCKED) return false
-            store.saveCurrent(current.copy(overlayState = ActivitySnapshot.OVERLAY_LOCKED, updatedAt = now))
+            persistCurrent(current.copy(overlayState = ActivitySnapshot.OVERLAY_LOCKED, updatedAt = now))
             return true
         }
 
@@ -95,14 +112,14 @@ class TvActivityTracker(private val context: Context) {
         }
 
         val changed = snapshot != current
-        if (changed) store.saveCurrent(snapshot)
+        if (changed) persistCurrent(snapshot)
         return changed
     }
 
-    fun current(): ActivitySnapshot? = store.current()
+    fun current(): ActivitySnapshot? = loadCurrent()
 
     fun observeAudioPlayback(runtimePackage: String, isPlaying: Boolean): Boolean {
-        val current = store.current() ?: return false
+        val current = loadCurrent() ?: return false
         val policyPackage = PolicyConstants.sourceLockPolicyPackage(runtimePackage) ?: runtimePackage
         if (current.packageName != policyPackage) return false
         val nextPlaybackState = if (isPlaying) MediaObservation.PLAYBACK_PLAYING else MediaObservation.PLAYBACK_PAUSED
@@ -115,7 +132,7 @@ class TvActivityTracker(private val context: Context) {
         ) {
             return false
         }
-        store.saveCurrent(
+        persistCurrent(
             current.copy(
                 playbackState = nextPlaybackState,
                 playbackSpeed = nextSpeed,
@@ -135,7 +152,7 @@ class TvActivityTracker(private val context: Context) {
         durationMs: Long?
     ): Boolean {
         val now = System.currentTimeMillis()
-        val current = store.current() ?: return false
+        val current = loadCurrent() ?: return false
         val policyPackage = PolicyConstants.sourceLockPolicyPackage(runtimePackage) ?: runtimePackage
         if (current.packageName != policyPackage) return false
         val nextTitle = title?.takeIf(String::isNotBlank) ?: current.mediaTitle
@@ -153,7 +170,7 @@ class TvActivityTracker(private val context: Context) {
             current.playbackSpeed != nextSpeed ||
             current.captureSource != nextSource
         if (!changed) return false
-        store.saveCurrent(
+        persistCurrent(
             current.copy(
                 mediaTitle = nextTitle,
                 mediaSubtitle = nextSubtitle,
@@ -171,8 +188,8 @@ class TvActivityTracker(private val context: Context) {
     }
 
     fun refreshCurrentForUpload(now: Long = System.currentTimeMillis()) {
-        val current = store.current() ?: return
-        store.saveCurrent(
+        val current = loadCurrent() ?: return
+        persistCurrent(
             current.copy(
                 positionMs = current.estimatedPosition(now),
                 positionCapturedAt = current.positionMs?.let { now },

@@ -6,6 +6,7 @@ import com.guardpulse.parentcontrol.shared.DateKeys
 import com.guardpulse.parentcontrol.shared.PinHasher
 import com.guardpulse.parentcontrol.shared.PolicyConstants
 import com.guardpulse.parentcontrol.tv.security.SecureValueStore
+import com.guardpulse.parentcontrol.tv.system.SystemTimeGuard
 import org.json.JSONObject
 
 data class PinRecord(
@@ -55,7 +56,10 @@ class FallbackStateStore(context: Context) {
             .put("algorithm", pin.algorithm)
             .put("iterations", pin.iterations)
             .put("updatedAt", pin.updatedAt)
-        secureStore.put("pin", json.toString())
+        // Fail closed on Keystore corruption: keep the previous record (and the
+        // legacy plaintext migration source) rather than wiping the PIN the
+        // parent can still enter once the Keystore recovers.
+        if (!secureStore.put("pin", json.toString())) return
         prefs.edit().remove("pin").apply()
     }
 
@@ -75,11 +79,11 @@ class FallbackStateStore(context: Context) {
         )
     }
 
-    fun pinRetryRemainingMs(now: Long = System.currentTimeMillis()): Long {
+    fun pinRetryRemainingMs(now: Long = SystemTimeGuard.now()): Long {
         return (prefs.getLong("pinBlockedUntil", 0L) - now).coerceAtLeast(0L)
     }
 
-    fun recordFailedPinAttempt(now: Long = System.currentTimeMillis()): PinRetryState {
+    fun recordFailedPinAttempt(now: Long = SystemTimeGuard.now()): PinRetryState {
         val attempts = prefs.getInt("pinFailedAttempts", 0) + 1
         val delayMs = pinDelayMs(attempts)
         prefs.edit()
@@ -97,39 +101,80 @@ class FallbackStateStore(context: Context) {
     }
 
     fun grantTemporaryUnlock(packageName: String, durationMs: Long = PolicyConstants.TEMP_UNLOCK_MS) {
-        val until = System.currentTimeMillis() + durationMs
+        val until = SystemTimeGuard.now() + durationMs
         prefs.edit().putLong("unlock:$packageName", until).apply()
     }
 
     fun isTemporarilyUnlocked(packageName: String): Boolean {
         val until = prefs.getLong("unlock:$packageName", 0L)
-        return until > System.currentTimeMillis()
+        return until > SystemTimeGuard.now()
     }
 
     fun grantAppVisitUnlock(policyPackage: String) {
-        prefs.edit().putString("appVisitUnlock", policyPackage).apply()
+        prefs.edit()
+            .putString("appVisitUnlock", policyPackage)
+            .putLong("appVisitUnlockAt", SystemTimeGuard.now())
+            .putInt("appVisitUnlockBoot", bootCount())
+            .apply()
     }
 
+    /** One-visit unlock expires after a day or a reboot — an HDMI-input switch
+     *  produces no window events, so time/boot binding is the only cleanup. */
     fun isAppVisitUnlocked(policyPackage: String): Boolean {
-        return prefs.getString("appVisitUnlock", null) == policyPackage
+        if (prefs.getString("appVisitUnlock", null) != policyPackage) return false
+        val grantedAt = prefs.getLong("appVisitUnlockAt", 0L)
+        if (grantedAt <= 0L || SystemTimeGuard.now() - grantedAt > APP_VISIT_UNLOCK_MAX_AGE_MS) return false
+        return prefs.getInt("appVisitUnlockBoot", Int.MIN_VALUE) == bootCount()
     }
 
-    fun appVisitUnlockPackage(): String? = prefs.getString("appVisitUnlock", null)
+    fun appVisitUnlockPackage(): String? {
+        return prefs.getString("appVisitUnlock", null)
+            ?.takeIf { granted ->
+                val grantedAt = prefs.getLong("appVisitUnlockAt", 0L)
+                grantedAt > 0L &&
+                    SystemTimeGuard.now() - grantedAt <= APP_VISIT_UNLOCK_MAX_AGE_MS &&
+                    prefs.getInt("appVisitUnlockBoot", Int.MIN_VALUE) == bootCount()
+            }
+    }
 
     fun clearAppVisitUnlock() {
-        prefs.edit().remove("appVisitUnlock").apply()
+        prefs.edit()
+            .remove("appVisitUnlock")
+            .remove("appVisitUnlockAt")
+            .remove("appVisitUnlockBoot")
+            .apply()
     }
 
     fun grantSettingsSectionUnlock(sectionKey: String) {
-        prefs.edit().putString("settingsSectionUnlock", sectionKey).apply()
+        prefs.edit().putBoolean("sectionUnlock:$sectionKey", true).apply()
     }
 
     fun isSettingsSectionUnlocked(sectionKey: String): Boolean {
-        return prefs.getString("settingsSectionUnlock", null) == sectionKey
+        return prefs.getBoolean("sectionUnlock:$sectionKey", false)
     }
 
-    fun clearSettingsSectionUnlock() {
-        prefs.edit().remove("settingsSectionUnlock").apply()
+    /** Clears one section's unlock, or every section when key is null. */
+    fun clearSettingsSectionUnlock(sectionKey: String? = null) {
+        val editor = prefs.edit()
+        if (sectionKey == null) {
+            prefs.all.keys
+                .filter { it.startsWith("sectionUnlock:") }
+                .forEach(editor::remove)
+        } else {
+            editor.remove("sectionUnlock:$sectionKey")
+        }
+        editor.apply()
+    }
+
+    /** While active, the accessibility service re-locks any settings-package
+     *  foreground so the DPM disable-confirm dialog cannot be completed after
+     *  pressing HOME away from the lock screen. */
+    fun grantAdminChangePendingGate(durationMs: Long = ADMIN_CHANGE_GATE_MS) {
+        prefs.edit().putLong("adminChangePendingUntil", SystemTimeGuard.now() + durationMs).apply()
+    }
+
+    fun isAdminChangePending(): Boolean {
+        return prefs.getLong("adminChangePendingUntil", 0L) > SystemTimeGuard.now()
     }
 
     fun grantSetupVisitUnlock() {
@@ -145,11 +190,11 @@ class FallbackStateStore(context: Context) {
     }
 
     fun grantSetupSettingsAccess(durationMs: Long = 120_000L) {
-        prefs.edit().putLong("setupSettingsUntil", System.currentTimeMillis() + durationMs).apply()
+        prefs.edit().putLong("setupSettingsUntil", SystemTimeGuard.now() + durationMs).apply()
     }
 
     fun isSetupSettingsAccessAllowed(): Boolean {
-        return prefs.getLong("setupSettingsUntil", 0L) > System.currentTimeMillis()
+        return prefs.getLong("setupSettingsUntil", 0L) > SystemTimeGuard.now()
     }
 
     fun saveLastForeground(packageName: String, observedAt: Long = System.currentTimeMillis()) {
@@ -185,7 +230,7 @@ class FallbackStateStore(context: Context) {
         packageName: String,
         baselineUsageMs: Long,
         startedAt: Long = System.currentTimeMillis(),
-        dayKey: String = DateKeys.today()
+        dayKey: String = DateKeys.dayKeyUtc(SystemTimeGuard.now())
     ) {
         finalizeLiveForegroundSession(startedAt)
         val committed = committedUsageMillisToday(dayKey)[packageName] ?: 0L
@@ -210,7 +255,7 @@ class FallbackStateStore(context: Context) {
     }
 
     fun liveForegroundSession(
-        dayKey: String = DateKeys.today(),
+        dayKey: String = DateKeys.dayKeyUtc(SystemTimeGuard.now()),
         now: Long = System.currentTimeMillis()
     ): LiveForegroundSession? {
         val packageName = prefs.getString("liveForegroundPackage", null)?.takeIf { it.isNotBlank() }
@@ -243,7 +288,8 @@ class FallbackStateStore(context: Context) {
     fun finalizeLiveForegroundSession(now: Long = System.currentTimeMillis()) {
         val packageName = prefs.getString("liveForegroundPackage", null)?.takeIf { it.isNotBlank() }
             ?: return
-        val dayKey = prefs.getString("liveForegroundDay", null) ?: DateKeys.today()
+        val dayKey = prefs.getString("liveForegroundDay", null)
+            ?: DateKeys.dayKeyUtc(SystemTimeGuard.now())
         val startedAt = prefs.getLong("liveForegroundStartedAt", 0L)
         val lastObservedAt = maxOf(
             prefs.getLong("liveForegroundLastObservedAt", startedAt),
@@ -258,7 +304,7 @@ class FallbackStateStore(context: Context) {
         clearLiveForegroundSessionInternal()
     }
 
-    fun committedUsageMillisToday(dayKey: String = DateKeys.today()): Map<String, Long> {
+    fun committedUsageMillisToday(dayKey: String = DateKeys.dayKeyUtc(SystemTimeGuard.now())): Map<String, Long> {
         val raw = prefs.getString("usageLedger:$dayKey", null) ?: return emptyMap()
         val json = runCatching { JSONObject(raw) }.getOrNull() ?: return emptyMap()
         return buildMap {
@@ -302,8 +348,8 @@ class FallbackStateStore(context: Context) {
     }
 
     fun pruneStaleKeys(retentionDays: Int = PRUNE_RETENTION_DAYS) {
-        val cutoffDay = DateKeys.daysAgo(retentionDays)
-        val now = System.currentTimeMillis()
+        val cutoffDay = DateKeys.utcDaysAgo(retentionDays, SystemTimeGuard.now())
+        val now = SystemTimeGuard.now()
         val editor = prefs.edit()
         var pruned = false
         for (key in prefs.all.keys.toList()) {
@@ -347,6 +393,8 @@ class FallbackStateStore(context: Context) {
         private const val SESSION_OBSERVE_PERSIST_MS = 30_000L
         private const val PRUNE_RETENTION_DAYS = 7
         private const val MAX_PIN_DELAY_MS = 5 * 60_000L
+        private const val APP_VISIT_UNLOCK_MAX_AGE_MS = 24L * 60L * 60_000L
+        private const val ADMIN_CHANGE_GATE_MS = 10L * 60_000L
 
         // Both services share this process (no android:process split), so these
         // overlays carry the per-event state; prefs persist it on a slow cadence

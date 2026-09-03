@@ -312,7 +312,10 @@ class MainActivity : Activity() {
                 setPadding(0, 0, 0, dp(4))
             })
             addView(body(
-                "Owner ${stateText(policyController.isDeviceOwner())}  |  Admin ${stateText(adminActive || !adminSetupAvailable)}  |  Accessibility ${stateText(accessibilityEnabled)}  |  Usage ${stateText(usageAccess)}  |  PIN ${stateText(pinConfigured)}  |  Firebase ${stateText(firebaseConfigured)}"
+                // Non-owner admin only provides force-lock; claim "limited"
+                // rather than a plain green so the status line can't imply
+                // uninstall-blocking that requires device owner.
+                "Owner ${stateText(policyController.isDeviceOwner())}  |  Admin ${adminStatusText(adminActive, adminSetupAvailable)}  |  Accessibility ${stateText(accessibilityEnabled)}  |  Usage ${stateText(usageAccess)}  |  PIN ${stateText(pinConfigured)}  |  Firebase ${stateText(firebaseConfigured)}"
             ).apply {
                 textSize = 12f
                 setTextColor(tvMuted)
@@ -1099,6 +1102,13 @@ class MainActivity : Activity() {
     }
 
     private fun stateText(ok: Boolean): String = if (ok) "OK" else "SETUP"
+
+    private fun adminStatusText(adminActive: Boolean, adminSetupAvailable: Boolean): String = when {
+        adminActive && policyController.isDeviceOwner() -> "OK"
+        adminActive -> "LIMITED"
+        !adminSetupAvailable -> "SETUP"
+        else -> "SETUP"
+    }
 
     private fun modeLabel(mode: String): String {
         return when (mode) {

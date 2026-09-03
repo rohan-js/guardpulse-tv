@@ -32,24 +32,32 @@ class SecureValueStore(
         }.getOrNull()
     }
 
-    fun put(key: String, value: String?) {
+    /**
+     * Returns false when the value could not be encrypted/persisted (typically a
+     * corrupted AndroidKeyStore after an OTA or power cut). Callers decide how to
+     * degrade — a throw here used to kill policy sync and the lock screen.
+     */
+    fun put(key: String, value: String?): Boolean {
         if (value == null) {
             preferences.edit().remove(encryptedKey(key)).apply()
-            return
+            return true
         }
-        val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.ENCRYPT_MODE, secretKey())
-        val encrypted = cipher.doFinal(value.toByteArray(Charsets.UTF_8))
-        val payload = cipher.iv + encrypted
-        preferences.edit()
-            .putString(encryptedKey(key), Base64.encodeToString(payload, Base64.NO_WRAP))
-            .apply()
+        return runCatching {
+            val cipher = Cipher.getInstance(TRANSFORMATION)
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey())
+            val encrypted = cipher.doFinal(value.toByteArray(Charsets.UTF_8))
+            val payload = cipher.iv + encrypted
+            preferences.edit()
+                .putString(encryptedKey(key), Base64.encodeToString(payload, Base64.NO_WRAP))
+                .apply()
+            true
+        }.getOrDefault(false)
     }
 
     fun migratePlaintext(key: String): String? {
         get(key)?.let { return it }
         val plaintext = preferences.getString(key, null) ?: return null
-        put(key, plaintext)
+        if (!put(key, plaintext)) return null
         preferences.edit().remove(key).apply()
         return plaintext
     }

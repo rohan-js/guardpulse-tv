@@ -30,7 +30,7 @@ class SettingsSectionDetectorTest {
     }
 
     @Test
-    fun devicePreferencesLocksOnlyRequestedRows() {
+    fun devicePreferencesMenuIsALockedSection() {
         val devicePreferences = """
             Device Preferences
             Home screen
@@ -38,6 +38,9 @@ class SettingsSectionDetectorTest {
             Chromecast built-in
             Screen saver
             Developer options
+            Language
+            Date & Time
+            Keyboard
             Location
             Usage & Diagnostics
             Security & restrictions
@@ -46,15 +49,27 @@ class SettingsSectionDetectorTest {
             Reset
         """.trimIndent()
 
-        assertNull(detect(focusedText = "", windowText = devicePreferences))
-        assertNull(detect(focusedText = "Home screen", windowText = devicePreferences))
-        assertNull(detect(focusedText = "Google Assistant", windowText = devicePreferences))
-        assertNull(detect(focusedText = "Chromecast built-in", windowText = devicePreferences))
-        assertNull(detect(focusedText = "Screen saver", windowText = devicePreferences))
-        assertNull(detect(focusedText = "Location", windowText = devicePreferences))
-        assertNull(detect(focusedText = "Usage & Diagnostics", windowText = devicePreferences))
-        assertNull(detect(focusedText = "TV lock", windowText = devicePreferences))
+        // The whole menu is a default-locked section now: Language / Date & Time
+        // / Keyboard used to be a deliberate blind spot and were the escape path
+        // for locale and clock tampering.
+        assertEquals(
+            PolicyConstants.SETTINGS_DEVICE_PREFERENCES_PACKAGE,
+            detect(focusedText = "", windowText = devicePreferences)?.policyPackage
+        )
+        assertEquals(
+            PolicyConstants.SETTINGS_DEVICE_PREFERENCES_PACKAGE,
+            detect(focusedText = "Home screen", windowText = devicePreferences)?.policyPackage
+        )
+        assertEquals(
+            PolicyConstants.SETTINGS_DEVICE_PREFERENCES_PACKAGE,
+            detect(focusedText = "Language", windowText = devicePreferences)?.policyPackage
+        )
+        assertEquals(
+            PolicyConstants.SETTINGS_DEVICE_PREFERENCES_PACKAGE,
+            detect(focusedText = "Date & Time", windowText = devicePreferences)?.policyPackage
+        )
 
+        // Focused protected rows still attribute their own precise section.
         assertEquals(
             PolicyConstants.SETTINGS_DEVELOPER_OPTIONS_PACKAGE,
             detect(focusedText = "Developer options", windowText = devicePreferences)?.policyPackage

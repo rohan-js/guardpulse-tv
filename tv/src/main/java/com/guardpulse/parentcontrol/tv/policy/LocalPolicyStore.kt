@@ -3,6 +3,7 @@ package com.guardpulse.parentcontrol.tv.policy
 import android.content.Context
 import android.content.SharedPreferences
 import com.guardpulse.parentcontrol.shared.DateKeys
+import com.guardpulse.parentcontrol.tv.system.SystemTimeGuard
 import org.json.JSONObject
 
 data class AppPolicy(
@@ -81,7 +82,7 @@ class LocalPolicyStore(context: Context) {
     }
 
     fun loadDailyLimitBlocks(): Set<String> {
-        val key = "dailyBlocks:${DateKeys.today()}"
+        val key = "dailyBlocks:${DateKeys.dayKeyUtc(SystemTimeGuard.now())}"
         synchronized(dayCacheLock) {
             dailyBlocksCache?.let { (cachedKey, cached) ->
                 if (cachedKey == key) return cached
@@ -93,7 +94,7 @@ class LocalPolicyStore(context: Context) {
     }
 
     fun markDailyLimitBlocked(packageName: String) {
-        val key = "dailyBlocks:${DateKeys.today()}"
+        val key = "dailyBlocks:${DateKeys.dayKeyUtc(SystemTimeGuard.now())}"
         val updated = loadDailyLimitBlocks().toMutableSet()
         updated.add(packageName)
         prefs.edit().putStringSet(key, updated).apply()
@@ -101,7 +102,7 @@ class LocalPolicyStore(context: Context) {
     }
 
     fun clearDailyLimitBlocks(packageName: String? = null) {
-        val key = "dailyBlocks:${DateKeys.today()}"
+        val key = "dailyBlocks:${DateKeys.dayKeyUtc(SystemTimeGuard.now())}"
         if (packageName == null) {
             prefs.edit().remove(key).apply()
             synchronized(dayCacheLock) { dailyBlocksCache = key to emptySet() }
@@ -137,7 +138,7 @@ class LocalPolicyStore(context: Context) {
     }
 
     fun saveUsageOffsetMs(packageName: String, usageMs: Long) {
-        val key = "usageOffsetsMs:${DateKeys.today()}"
+        val key = "usageOffsetsMs:${DateKeys.dayKeyUtc(SystemTimeGuard.now())}"
         val values = loadUsageOffsetsMs().toMutableMap()
         values[packageName] = usageMs.coerceAtLeast(0L)
         saveLongMap(key, values)
@@ -188,7 +189,7 @@ class LocalPolicyStore(context: Context) {
 
     /** Removes day-keyed entries older than the retention window; called on service start. */
     fun pruneStaleDays(retentionDays: Int = 7) {
-        val cutoffDay = DateKeys.daysAgo(retentionDays)
+        val cutoffDay = DateKeys.utcDaysAgo(retentionDays, SystemTimeGuard.now())
         val editor = prefs.edit()
         var pruned = false
         for (key in prefs.all.keys.toList()) {

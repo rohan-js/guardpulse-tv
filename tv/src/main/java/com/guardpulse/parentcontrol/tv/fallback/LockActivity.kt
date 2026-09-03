@@ -36,6 +36,7 @@ import com.guardpulse.parentcontrol.shared.PolicyConstants
 import com.guardpulse.parentcontrol.tv.R
 import com.guardpulse.parentcontrol.tv.policy.LocalPolicyStore
 import com.guardpulse.parentcontrol.tv.sync.TamperEventQueue
+import com.guardpulse.parentcontrol.tv.system.SystemTimeGuard
 
 class LockActivity : Activity() {
     private lateinit var fallbackStore: FallbackStateStore
@@ -418,6 +419,21 @@ class LockActivity : Activity() {
             )
         ) {
             fallbackStore.clearFailedPinAttempts()
+            // Transparently upgrade a legacy (v1, unsalted-iteration) PIN hash to
+            // the current PBKDF2 parameters on the next successful verify.
+            if (record.version == PinHasher.LEGACY_VERSION) {
+                val upgraded = PinHasher.create(pin)
+                fallbackStore.savePin(
+                    PinRecord(
+                        salt = upgraded.salt,
+                        hash = upgraded.hash,
+                        version = upgraded.version,
+                        algorithm = upgraded.algorithm,
+                        iterations = upgraded.iterations,
+                        updatedAt = SystemTimeGuard.now()
+                    )
+                )
+            }
             if (isSettingsSectionGate()) {
                 settingsSectionKey?.let(fallbackStore::grantSettingsSectionUnlock)
             } else if (isSetupGate()) {

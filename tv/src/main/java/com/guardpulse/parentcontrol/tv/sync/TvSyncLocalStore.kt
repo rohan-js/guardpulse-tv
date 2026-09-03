@@ -1,18 +1,11 @@
 package com.guardpulse.parentcontrol.tv.sync
 
 import android.content.Context
-import com.guardpulse.parentcontrol.shared.ControlSnapshotV2
-import com.guardpulse.parentcontrol.tv.security.SecureValueStore
 import org.json.JSONArray
 import org.json.JSONObject
 
 class TvSyncLocalStore(context: Context) {
     private val prefs = context.getSharedPreferences("tv_sync_runtime", Context.MODE_PRIVATE)
-    private val secureStore = SecureValueStore(
-        context,
-        "tv_sync_runtime",
-        "guardpulse.sync.snapshot"
-    )
 
     fun activateV2(revisionId: String) {
         prefs.edit()
@@ -25,20 +18,21 @@ class TvSyncLocalStore(context: Context) {
 
     fun lastV2Revision(): String? = prefs.getString("lastV2Revision", null)
 
-    fun saveValidV2Snapshot(snapshot: ControlSnapshotV2) {
-        secureStore.put("lastValidV2Snapshot", JSONObject(snapshot.toFirebaseMap()).toString())
-        prefs.edit().remove("lastValidV2Snapshot").apply()
-    }
-
-    fun lastValidV2SnapshotJson(): String? =
-        secureStore.migratePlaintext("lastValidV2Snapshot")
-
     fun saveAppliedV2Revision(revisionId: String, sessionId: String?) {
         prefs.edit()
             .putString("lastAppliedV2Revision", revisionId)
             .putString("lastAppliedSessionId", sessionId)
             .apply()
     }
+
+    /** Package keys from the last successfully uploaded inventory; the state
+     *  uploader diffs against this to delete state children of uninstalled apps. */
+    fun saveInventoryPackageKeys(keys: Set<String>) {
+        prefs.edit().putStringSet("inventoryPackageKeys", keys).apply()
+    }
+
+    fun inventoryPackageKeys(): Set<String> =
+        prefs.getStringSet("inventoryPackageKeys", emptySet())?.toSet().orEmpty()
 
     fun lastAppliedV2Revision(): String? = prefs.getString("lastAppliedV2Revision", null)
     fun lastAppliedSessionId(): String? = prefs.getString("lastAppliedSessionId", null)
