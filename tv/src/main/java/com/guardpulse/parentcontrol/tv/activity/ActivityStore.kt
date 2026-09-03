@@ -7,7 +7,7 @@ import android.database.sqlite.SQLiteOpenHelper
 import org.json.JSONObject
 
 class ActivityStore(context: Context) :
-    SQLiteOpenHelper(context.applicationContext, "activity_history.db", null, 2) {
+    SQLiteOpenHelper(context.applicationContext, "activity_history.db", null, 3) {
     private val prefs = context.getSharedPreferences("activity_state", Context.MODE_PRIVATE)
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -27,6 +27,7 @@ class ActivityStore(context: Context) :
                 playback_state TEXT,
                 confidence TEXT,
                 capture_source TEXT,
+                overlay_ms INTEGER NOT NULL DEFAULT 0,
                 uploaded INTEGER NOT NULL DEFAULT 0
             )
             """.trimIndent()
@@ -37,6 +38,9 @@ class ActivityStore(context: Context) :
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         if (oldVersion < 2) {
             db.execSQL("ALTER TABLE history ADD COLUMN capture_source TEXT")
+        }
+        if (oldVersion < 3) {
+            db.execSQL("ALTER TABLE history ADD COLUMN overlay_ms INTEGER NOT NULL DEFAULT 0")
         }
     }
 
@@ -70,6 +74,7 @@ class ActivityStore(context: Context) :
                 put("playback_state", record.playbackState)
                 put("confidence", record.confidence)
                 put("capture_source", record.captureSource)
+                put("overlay_ms", record.overlayMs)
                 put("uploaded", 0)
             },
             SQLiteDatabase.CONFLICT_REPLACE
@@ -106,7 +111,8 @@ class ActivityStore(context: Context) :
                             playbackState = it.stringOrNull("playback_state"),
                             confidence = it.stringOrNull("confidence"),
                             captureSource = it.stringOrNull("capture_source")
-                                ?: MediaObservation.SOURCE_ACCESSIBILITY
+                                ?: MediaObservation.SOURCE_ACCESSIBILITY,
+                            overlayMs = it.longOrNull("overlay_ms") ?: 0L
                         )
                     )
                 }
@@ -145,6 +151,8 @@ class ActivityStore(context: Context) :
         .put("mediaStartedAt", mediaStartedAt)
         .put("mediaConfidence", mediaConfidence)
         .put("captureSource", captureSource)
+        .put("overlayStartedAt", overlayStartedAt)
+        .put("overlayMs", overlayMs)
         .put("updatedAt", updatedAt)
 
     private fun JSONObject.toSnapshot() = ActivitySnapshot(
@@ -163,6 +171,8 @@ class ActivityStore(context: Context) :
         mediaStartedAt = optionalLong("mediaStartedAt"),
         mediaConfidence = optionalString("mediaConfidence"),
         captureSource = optionalString("captureSource") ?: MediaObservation.SOURCE_ACCESSIBILITY,
+        overlayStartedAt = optionalLong("overlayStartedAt"),
+        overlayMs = optLong("overlayMs", 0L),
         updatedAt = getLong("updatedAt")
     )
 

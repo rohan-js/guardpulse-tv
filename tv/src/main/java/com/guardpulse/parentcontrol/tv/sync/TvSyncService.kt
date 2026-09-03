@@ -109,6 +109,7 @@ class TvSyncService : Service() {
     private var lastUploadedActivityCurrent: Map<String, Any?>? = null
     private var lastActivityDbPruneAt = 0L
     private var activityStore: ActivityStore? = null
+    private var repairLegacyStateChildren: Set<String>? = null
 
     // Last successfully uploaded payloads: diffing against these keeps idle ticks
     // write-free. In-memory only — a process restart does one full re-upload.
@@ -224,8 +225,20 @@ class TvSyncService : Service() {
 
     private fun onFirebaseReady(user: FirebaseUser) {
         authRetryDelayMs = 5_000L
+        listenerRetryDelayMs = 5_000L
         lastSyncError = null
         db = FirebaseDatabase.getInstance().reference
+        // Capture the server-side state key set once so applyPoliciesAndUpload
+        // can delete legacy debris it would otherwise never diff against.
+        db?.child(FirebasePaths.deviceStateApps(deviceId))
+            ?.orderByKey()
+            ?.addListenerForSingleValueEvent(object : ValueEventListener {
+                override fun onDataChange(snapshot: DataSnapshot) {
+                    repairLegacyStateChildren = snapshot.children.mapNotNull { it.key }.toSet()
+                }
+
+                override fun onCancelled(error: DatabaseError) = Unit
+            })
         startSyncEngine()
         registerDevice(user.uid)
         recoverPairingStatus()
@@ -1595,6 +1608,15 @@ class TvSyncService : Service() {
         // explicit deletions for anything that disappeared since the last scan.
         val removedKeys = syncLocalStore.inventoryPackageKeys() - states.keys
         removedKeys.forEach { key -> states[key] = null }
+        // One-time repair for pre-fix debris (children that never belonged to
+        // any inventory snapshot, incl. partial leaf nodes created by the old
+        // foreground-usage writer): fetched once per process from the server.
+        repairLegacyStateChildren?.let { legacyKeys ->
+            repairLegacyStateChildren = null
+            (legacyKeys - states.keys - syncLocalStore.inventoryPackageKeys()).forEach { key ->
+                states[key] = null
+            }
+        }
 
         val root = db ?: run {
             onComplete?.invoke(Result.failure(IllegalStateException("Firebase is unavailable")))
@@ -1689,6 +1711,15 @@ class TvSyncService : Service() {
             return
         }
         val packageName = session.packageName
+        // Leaf updates into a state child that does not exist would create a
+        // partial node the rules reject (state validate requires the full field
+        // set). Packages outside the inventory have no state child by design —
+        // their usage stays device-local and nothing is uploaded for them.
+        if (currentInventory().none { it.packageName == packageName }) {
+            markChannelSynced("usage")
+            onComplete?.invoke(Result.success(Unit))
+            return
+        }
         val rawUsageMs = usageTracker.effectiveUsageMillisToday(
             session,
             fallbackStore.committedUsageMillisToday()
@@ -1761,10 +1792,10 @@ class TvSyncService : Service() {
         // putIfAbsent, and the per-visit PIN keeps the parent's own access.
         val settingsDefaultLock = FallbackProtection.enforcementMode(this) !=
             PolicyConstants.ENFORCEMENT_DEVICE_OWNER
-        val merged = (activeMode?.appPolicies ?: basePolicies).toMutableMap()
-        PolicyConstants.defaultLockedPackages.forEach { packageName ->
-            merged.putIfAbsent(packageName, AppPolicy(manualBlocked = true))
-        }
+        val merged = EffectivePolicies.merge(
+            basePolicies = basePolicies,
+            activeModeAppPolicies = activeMode?.appPolicies
+        ).toMutableMap()
         if (settingsDefaultLock) {
             PolicyConstants.primarySettingsPackages.forEach { packageName ->
                 merged.putIfAbsent(packageName, AppPolicy(manualBlocked = true))

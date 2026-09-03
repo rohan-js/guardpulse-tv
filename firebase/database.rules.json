@@ -300,7 +300,7 @@
         "activity": {
           ".write": "auth != null && root.child('devices').child($deviceId).child('meta').child('tvUid').val() == auth.uid",
           "current": {
-            ".validate": "newData.hasChildren(['packageName', 'appLabel', 'appStartedAt', 'overlayState', 'updatedAt']) && newData.child('packageName').isString() && newData.child('appLabel').isString() && newData.child('appStartedAt').isNumber() && (newData.child('overlayState').val() == 'none' || newData.child('overlayState').val() == 'locked') && newData.child('updatedAt').isNumber() && (!newData.child('runtimePackage').exists() || newData.child('runtimePackage').isString()) && (!newData.child('mediaAvailable').exists() || newData.child('mediaAvailable').isBoolean()) && (!newData.child('mediaTitle').exists() || newData.child('mediaTitle').isString()) && (!newData.child('mediaSubtitle').exists() || newData.child('mediaSubtitle').isString()) && (!newData.child('playbackState').exists() || newData.child('playbackState').isString()) && (!newData.child('positionMs').exists() || newData.child('positionMs').isNumber()) && (!newData.child('durationMs').exists() || newData.child('durationMs').isNumber()) && (!newData.child('positionCapturedAt').exists() || newData.child('positionCapturedAt').isNumber()) && (!newData.child('playbackSpeed').exists() || newData.child('playbackSpeed').isNumber()) && (!newData.child('mediaStartedAt').exists() || newData.child('mediaStartedAt').isNumber()) && (!newData.child('mediaConfidence').exists() || newData.child('mediaConfidence').isString()) && (!newData.child('captureSource').exists() || newData.child('captureSource').isString())",
+            ".validate": "newData.hasChildren(['packageName', 'appLabel', 'appStartedAt', 'overlayState', 'updatedAt']) && newData.child('packageName').isString() && newData.child('appLabel').isString() && newData.child('appStartedAt').isNumber() && (newData.child('overlayState').val() == 'none' || newData.child('overlayState').val() == 'locked') && newData.child('updatedAt').isNumber() && (!newData.child('runtimePackage').exists() || newData.child('runtimePackage').isString()) && (!newData.child('mediaAvailable').exists() || newData.child('mediaAvailable').isBoolean()) && (!newData.child('mediaTitle').exists() || newData.child('mediaTitle').isString()) && (!newData.child('mediaSubtitle').exists() || newData.child('mediaSubtitle').isString()) && (!newData.child('playbackState').exists() || newData.child('playbackState').isString()) && (!newData.child('positionMs').exists() || newData.child('positionMs').isNumber()) && (!newData.child('durationMs').exists() || newData.child('durationMs').isNumber()) && (!newData.child('positionCapturedAt').exists() || newData.child('positionCapturedAt').isNumber()) && (!newData.child('playbackSpeed').exists() || newData.child('playbackSpeed').isNumber()) && (!newData.child('mediaStartedAt').exists() || newData.child('mediaStartedAt').isNumber()) && (!newData.child('mediaConfidence').exists() || newData.child('mediaConfidence').isString()) && (!newData.child('captureSource').exists() || newData.child('captureSource').isString()) && (!newData.child('overlayStartedAt').exists() || newData.child('overlayStartedAt').isNumber()) && (!newData.child('overlayMs').exists() || newData.child('overlayMs').isNumber())",
             "runtimePackage": {},
             "packageName": {},
             "appLabel": {},
@@ -317,13 +317,15 @@
             "mediaStartedAt": {},
             "mediaConfidence": {},
             "captureSource": {},
+            "overlayStartedAt": {},
+            "overlayMs": {},
             "updatedAt": {},
             "$other": { ".validate": false }
           },
           "history": {
             ".indexOn": ["startedAt"],
             "$recordId": {
-              ".validate": "newData.hasChildren(['type', 'packageName', 'appLabel', 'startedAt', 'endedAt']) && (newData.child('type').val() == 'app' || newData.child('type').val() == 'media') && newData.child('packageName').isString() && newData.child('appLabel').isString() && newData.child('startedAt').isNumber() && newData.child('endedAt').isNumber() && (!newData.child('id').exists() || newData.child('id').isString()) && (!newData.child('title').exists() || newData.child('title').isString()) && (!newData.child('subtitle').exists() || newData.child('subtitle').isString()) && (!newData.child('lastPositionMs').exists() || newData.child('lastPositionMs').isNumber()) && (!newData.child('durationMs').exists() || newData.child('durationMs').isNumber()) && (!newData.child('playbackState').exists() || newData.child('playbackState').isString()) && (!newData.child('confidence').exists() || newData.child('confidence').isString()) && (!newData.child('captureSource').exists() || newData.child('captureSource').isString()) && (!newData.child('updatedAt').exists() || newData.child('updatedAt').isNumber())",
+              ".validate": "newData.hasChildren(['type', 'packageName', 'appLabel', 'startedAt', 'endedAt']) && (newData.child('type').val() == 'app' || newData.child('type').val() == 'media') && newData.child('packageName').isString() && newData.child('appLabel').isString() && newData.child('startedAt').isNumber() && newData.child('endedAt').isNumber() && (!newData.child('id').exists() || newData.child('id').isString()) && (!newData.child('title').exists() || newData.child('title').isString()) && (!newData.child('subtitle').exists() || newData.child('subtitle').isString()) && (!newData.child('lastPositionMs').exists() || newData.child('lastPositionMs').isNumber()) && (!newData.child('durationMs').exists() || newData.child('durationMs').isNumber()) && (!newData.child('playbackState').exists() || newData.child('playbackState').isString()) && (!newData.child('confidence').exists() || newData.child('confidence').isString()) && (!newData.child('captureSource').exists() || newData.child('captureSource').isString()) && (!newData.child('overlayMs').exists() || newData.child('overlayMs').isNumber()) && (!newData.child('updatedAt').exists() || newData.child('updatedAt').isNumber())",
               "id": {},
               "type": {},
               "packageName": {},
@@ -337,6 +339,7 @@
               "playbackState": {},
               "confidence": {},
               "captureSource": {},
+              "overlayMs": {},
               "updatedAt": {},
               "$other": { ".validate": false }
             }

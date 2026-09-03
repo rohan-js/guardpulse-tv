@@ -566,6 +566,43 @@ internal fun SecurityTab(
                 }
             }
         }
+        item { GuardSectionTitle("Approved — Waiting for TV") }
+        val approvedWaiting = unlockRequests.filter {
+            it.status == PolicyConstants.UNLOCK_APPROVED &&
+                it.tvApplyStatus != PolicyConstants.SYNC_STATUS_APPLIED
+        }
+        if (approvedWaiting.isEmpty()) {
+            item {
+                Text(
+                    "No approvals are waiting on the TV.",
+                    color = TextMuted,
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+        }
+        items(approvedWaiting) { request ->
+            GuardCard {
+                val appLabel = apps[request.packageName]?.label ?: request.packageName
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(appLabel, color = GuardNavy, fontWeight = FontWeight.Bold)
+                        Text(
+                            request.packageName,
+                            color = TextMuted,
+                            style = MaterialTheme.typography.labelMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            "Approved ${formatAge(request.updatedAt)} · ${unlockApprovalLabel(request)}",
+                            color = TextMuted,
+                            style = MaterialTheme.typography.labelMedium
+                        )
+                    }
+                    StatusLabel("Waiting for TV", ActionBlue)
+                }
+            }
+        }
     }
 }
 

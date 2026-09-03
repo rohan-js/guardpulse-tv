@@ -132,6 +132,54 @@ data class ParentCommand(
     val error: String? = null
 )
 
+data class ParentActivityNow(
+    val packageName: String,
+    val appLabel: String,
+    val appStartedAt: Long,
+    val overlayState: String = "none",
+    val mediaTitle: String? = null,
+    val mediaSubtitle: String? = null,
+    val playbackState: String = "unknown",
+    val positionMs: Long? = null,
+    val durationMs: Long? = null,
+    val positionCapturedAt: Long? = null,
+    val playbackSpeed: Float = 0f,
+    val updatedAt: Long
+) {
+    fun isStale(now: Long): Boolean = now - updatedAt > STALE_AFTER_MS
+
+    /** Locally interpolated playhead — the TV uploads snapshots infrequently. */
+    fun interpolatedPositionMs(now: Long): Long? {
+        val base = positionMs ?: return null
+        if (playbackState != "playing") return base
+        val capturedAt = positionCapturedAt ?: return base
+        val elapsed = (now - capturedAt).coerceAtLeast(0L)
+        val estimate = base + (elapsed * playbackSpeed).toLong()
+        return durationMs?.let { estimate.coerceAtMost(it) } ?: estimate
+    }
+
+    companion object {
+        const val STALE_AFTER_MS = 90_000L
+        const val OVERLAY_LOCKED = "locked"
+    }
+}
+
+data class ParentActivityRecord(
+    val id: String,
+    val type: String,
+    val packageName: String,
+    val appLabel: String,
+    val title: String? = null,
+    val subtitle: String? = null,
+    val startedAt: Long,
+    val endedAt: Long,
+    val durationMs: Long? = null,
+    val playbackState: String? = null,
+    val overlayMs: Long = 0L
+) {
+    fun isMedia(): Boolean = type == "media"
+}
+
 data class PairRequestState(
     val deviceId: String,
     val requestId: String,
@@ -179,6 +227,8 @@ data class ParentSyncUiState(
     val unlockRequests: List<UnlockRequest> = emptyList(),
     val tamperEvents: List<TamperEvent> = emptyList(),
     val commands: List<ParentCommand> = emptyList(),
+    val activityCurrent: ParentActivityNow? = null,
+    val activityHistory: List<ParentActivityRecord> = emptyList(),
     val pairRequest: PairRequestState? = null,
     val desiredRevision: SyncDesiredRevision? = null,
     val appliedRevision: SyncAppliedRevision = SyncAppliedRevision(),
@@ -228,4 +278,24 @@ internal fun ParentSyncUiState.isAppPolicyPending(packageName: String): Boolean 
     val confirmedRule = confirmed.apps[packageName]
     return desiredRule?.manualBlocked != confirmedRule?.manualBlocked ||
         desiredRule?.dailyLimitMinutes != confirmedRule?.dailyLimitMinutes
+}
+
+/**
+ * True while the parent's requested policy for an app has not been reflected
+ * by the TV — either the TV acked an older snapshot (desired vs confirmed
+ * differ) or it has never confirmed anything while a desired snapshot exists
+ * (the pre-confirmation hole the original predicate missed).
+ */
+internal fun ParentSyncUiState.isAppPolicyWaitingForTv(packageName: String): Boolean {
+    val desired = desiredControl ?: return false
+    val confirmed = confirmedControl
+    val desiredRule = desired.apps[packageName]
+    if (confirmed == null) {
+        return appliedRevision.revisionId != desired.revisionId ||
+            appliedRevision.status != PolicyConstants.SYNC_STATUS_APPLIED
+    }
+    val confirmedRule = confirmed.apps[packageName]
+    val ruleChanged = desiredRule?.manualBlocked != confirmedRule?.manualBlocked ||
+        desiredRule?.dailyLimitMinutes != confirmedRule?.dailyLimitMinutes
+    return ruleChanged || isAppPolicyPending(packageName)
 }

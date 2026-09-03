@@ -47,6 +47,8 @@ data class ActivitySnapshot(
     val mediaStartedAt: Long? = null,
     val mediaConfidence: String? = null,
     val captureSource: String = MediaObservation.SOURCE_ACCESSIBILITY,
+    val overlayStartedAt: Long? = null,
+    val overlayMs: Long = 0L,
     val updatedAt: Long
 ) {
     fun toFirebaseMap(): Map<String, Any?> = mapOf(
@@ -66,6 +68,8 @@ data class ActivitySnapshot(
         "mediaStartedAt" to mediaStartedAt,
         "mediaConfidence" to mediaConfidence,
         "captureSource" to captureSource,
+        "overlayStartedAt" to overlayStartedAt,
+        "overlayMs" to overlayMs,
         "updatedAt" to updatedAt
     )
 
@@ -88,7 +92,8 @@ data class ActivityHistoryRecord(
     val durationMs: Long?,
     val playbackState: String?,
     val confidence: String?,
-    val captureSource: String = MediaObservation.SOURCE_ACCESSIBILITY
+    val captureSource: String = MediaObservation.SOURCE_ACCESSIBILITY,
+    val overlayMs: Long = 0L
 ) {
     fun toFirebaseMap(): Map<String, Any?> = mapOf(
         "id" to id,
@@ -104,6 +109,7 @@ data class ActivityHistoryRecord(
         "playbackState" to playbackState,
         "confidence" to confidence,
         "captureSource" to captureSource,
+        "overlayMs" to overlayMs,
         "updatedAt" to endedAt
     )
 

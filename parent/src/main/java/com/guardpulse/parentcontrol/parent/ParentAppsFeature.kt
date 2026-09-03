@@ -186,7 +186,7 @@ internal fun AppsTab(
                 liveStates = states,
                 confirmedStates = confirmedStates
             )
-            val pending = syncState.isAppPolicyPending(app.packageName)
+            val pending = syncState.isAppPolicyWaitingForTv(app.packageName)
             val requestedPolicy = syncState.desiredControl?.apps?.get(app.packageName)?.let { rule ->
                 ParentPolicy(rule.manualBlocked, rule.dailyLimitMinutes)
             }

@@ -40,11 +40,14 @@ class TvActivityTracker(private val context: Context) {
         if (runtimePackage == "com.android.systemui") return false
         if (runtimePackage == context.packageName) {
             if (current == null) return false
-            val lockClass = eventClassName?.toString()?.contains(LockActivity::class.java.simpleName) == true ||
-                eventClassName?.toString() == LockActivity::class.java.name
-            if (!lockClass && current.overlayState == ActivitySnapshot.OVERLAY_LOCKED) return false
             if (current.overlayState == ActivitySnapshot.OVERLAY_LOCKED) return false
-            persistCurrent(current.copy(overlayState = ActivitySnapshot.OVERLAY_LOCKED, updatedAt = now))
+            persistCurrent(
+                current.copy(
+                    overlayState = ActivitySnapshot.OVERLAY_LOCKED,
+                    overlayStartedAt = now,
+                    updatedAt = now
+                )
+            )
             return true
         }
 
@@ -64,9 +67,8 @@ class TvActivityTracker(private val context: Context) {
                 updatedAt = now
             )
         } else {
-            requireNotNull(current).copy(
+            requireNotNull(current).withOverlayClosed(now).copy(
                 runtimePackage = runtimePackage,
-                overlayState = ActivitySnapshot.OVERLAY_NONE,
                 updatedAt = now
             )
         }
@@ -210,26 +212,41 @@ class TvActivityTracker(private val context: Context) {
     fun pruneBefore(cutoff: Long) = store.pruneBefore(cutoff)
 
     private fun closeCurrentSessions(snapshot: ActivitySnapshot, endedAt: Long) {
-        closeMediaSession(snapshot, endedAt)
-        if (endedAt - snapshot.appStartedAt >= MIN_SESSION_MS) {
+        val closed = snapshot.withOverlayClosed(endedAt)
+        closeMediaSession(closed, endedAt)
+        if (endedAt - closed.appStartedAt >= MIN_SESSION_MS) {
             store.addHistory(
                 ActivityHistoryRecord(
                     id = UUID.randomUUID().toString(),
                     type = ActivityHistoryRecord.TYPE_APP,
-                    packageName = snapshot.packageName,
-                    appLabel = snapshot.appLabel,
+                    packageName = closed.packageName,
+                    appLabel = closed.appLabel,
                     title = null,
                     subtitle = null,
-                    startedAt = snapshot.appStartedAt,
+                    startedAt = closed.appStartedAt,
                     endedAt = endedAt,
                     lastPositionMs = null,
                     durationMs = null,
                     playbackState = null,
                     confidence = null,
-                    captureSource = snapshot.captureSource
+                    captureSource = closed.captureSource,
+                    overlayMs = closed.overlayMs
                 )
             )
         }
+    }
+
+    /** Returns the snapshot with any in-progress lock-overlay period folded into
+     *  the accumulated overlayMs — the phone renders this as a lock marker. */
+    private fun ActivitySnapshot.withOverlayClosed(now: Long): ActivitySnapshot {
+        if (overlayState != ActivitySnapshot.OVERLAY_LOCKED) return this
+        val startedAt = overlayStartedAt
+            ?: return copy(overlayState = ActivitySnapshot.OVERLAY_NONE)
+        return copy(
+            overlayState = ActivitySnapshot.OVERLAY_NONE,
+            overlayMs = overlayMs + (now - startedAt).coerceAtLeast(0L),
+            overlayStartedAt = null
+        )
     }
 
     private fun closeMediaSession(snapshot: ActivitySnapshot, endedAt: Long) {
@@ -254,7 +271,8 @@ class TvActivityTracker(private val context: Context) {
                 durationMs = snapshot.durationMs,
                 playbackState = snapshot.playbackState,
                 confidence = snapshot.mediaConfidence,
-                captureSource = snapshot.captureSource
+                captureSource = snapshot.captureSource,
+                overlayMs = snapshot.overlayMs
             )
         )
     }

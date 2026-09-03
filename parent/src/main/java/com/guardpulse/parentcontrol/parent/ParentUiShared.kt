@@ -36,6 +36,7 @@ import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Lock
+import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Security
@@ -316,7 +317,7 @@ internal fun TopBar(selectedDeviceId: String?, onSignOut: () -> Unit) {
 
 @Composable
 internal fun BottomNav(selected: Int, onSelect: (Int) -> Unit) {
-    val labels = listOf("Devices", "Apps", "Security", "Events")
+    val labels = listOf("Devices", "Activity", "Apps", "Security", "Events")
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -338,8 +339,9 @@ internal fun BottomNav(selected: Int, onSelect: (Int) -> Unit) {
                 Icon(
                     imageVector = when (index) {
                         0 -> Icons.Outlined.Tv
-                        1 -> Icons.Outlined.Add
-                        2 -> Icons.Outlined.Security
+                        1 -> Icons.Outlined.PlayArrow
+                        2 -> Icons.Outlined.Add
+                        3 -> Icons.Outlined.Security
                         else -> Icons.Outlined.Lock
                     },
                     contentDescription = label,

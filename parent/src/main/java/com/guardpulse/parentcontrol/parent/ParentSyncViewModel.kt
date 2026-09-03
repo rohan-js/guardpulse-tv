@@ -382,6 +382,10 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
             override fun onUnlockRequests(value: List<UnlockRequest>) = setState { it.copy(unlockRequests = value) }
             override fun onTamperEvents(value: List<TamperEvent>) = setState { it.copy(tamperEvents = value) }
             override fun onCommands(value: List<ParentCommand>) = setState { it.copy(commands = value) }
+            override fun onActivityCurrent(value: ParentActivityNow?) =
+                setState { it.copy(activityCurrent = value) }
+            override fun onActivityHistory(value: List<ParentActivityRecord>) =
+                setState { it.copy(activityHistory = value.sortedByDescending { it.startedAt }) }
 
             override fun onDesiredRevision(snapshot: com.google.firebase.database.DataSnapshot) {
                 setState { it.copy(desiredRevision = ControlProtocol.parseDesired(snapshot)) }
@@ -480,6 +484,8 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
                 unlockRequests = emptyList(),
                 tamperEvents = emptyList(),
                 commands = emptyList(),
+                activityCurrent = null,
+                activityHistory = emptyList(),
                 desiredRevision = null,
                 appliedRevision = com.guardpulse.parentcontrol.shared.SyncAppliedRevision(),
                 desiredControl = null,
@@ -511,6 +517,8 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
                 unlockRequests = emptyList(),
                 tamperEvents = emptyList(),
                 commands = emptyList(),
+                activityCurrent = null,
+                activityHistory = emptyList(),
                 desiredRevision = null,
                 appliedRevision = com.guardpulse.parentcontrol.shared.SyncAppliedRevision(),
                 desiredControl = null,

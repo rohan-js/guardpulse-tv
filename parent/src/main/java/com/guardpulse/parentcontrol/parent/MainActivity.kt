@@ -77,6 +77,8 @@ class MainActivity : ComponentActivity() {
                             security = state.security,
                             unlockRequests = state.unlockRequests,
                             tamperEvents = state.tamperEvents,
+                            activityCurrent = state.activityCurrent,
+                            activityHistory = state.activityHistory,
                             syncState = state,
                             loadingDeviceDetails = state.loadingDeviceDetails,
                             onSignOut = syncViewModel::signOut,
@@ -174,6 +176,8 @@ private fun ParentDashboard(
     security: SecurityRuntime,
     unlockRequests: List<UnlockRequest>,
     tamperEvents: List<TamperEvent>,
+    activityCurrent: ParentActivityNow?,
+    activityHistory: List<ParentActivityRecord>,
     syncState: ParentSyncUiState,
     loadingDeviceDetails: Boolean,
     onSignOut: () -> Unit,
@@ -246,7 +250,15 @@ private fun ParentDashboard(
                     onPair,
                     onScanQr
                 )
-                1 -> AppsTab(
+                1 -> ActivityTab(
+                    selectedDevice,
+                    selectedDeviceId,
+                    loadingDeviceDetails,
+                    activityCurrent,
+                    activityHistory,
+                    syncState.serverNow
+                )
+                2 -> AppsTab(
                     selectedDevice,
                     selectedDeviceId,
                     loadingDeviceDetails,
@@ -268,7 +280,7 @@ private fun ParentDashboard(
                         ) { onResetToday(packageName) }
                     }
                 )
-                2 -> SecurityTab(
+                3 -> SecurityTab(
                     selectedDeviceId,
                     loadingDeviceDetails,
                     apps,
@@ -305,7 +317,7 @@ private fun ParentDashboard(
                     onReconnect,
                     onRepairControl
                 )
-                3 -> EventsTab(tamperEvents)
+                4 -> EventsTab(tamperEvents)
             }
             confirmAction?.let { action ->
                 ConfirmDialog(

@@ -30,6 +30,8 @@ class ParentSyncRepository(private val database: DatabaseReference) {
         fun onUnlockRequests(value: List<UnlockRequest>)
         fun onTamperEvents(value: List<TamperEvent>)
         fun onCommands(value: List<ParentCommand>)
+        fun onActivityCurrent(value: ParentActivityNow?)
+        fun onActivityHistory(value: List<ParentActivityRecord>)
         fun onDesiredRevision(snapshot: DataSnapshot)
         fun onAppliedRevision(value: SyncAppliedRevision)
         fun onSyncRuntime(value: SyncRuntimeState)
@@ -308,6 +310,60 @@ class ParentSyncRepository(private val database: DatabaseReference) {
                     error = child.child("error").getValue(String::class.java)
                 )
             }.sortedByDescending { it.createdAt ?: 0L })
+        }
+        observe(FirebasePaths.deviceActivityCurrent(deviceId), observer) { snapshot ->
+            observer.onActivityCurrent(
+                if (snapshot.exists()) {
+                    ParentActivityNow(
+                        packageName = snapshot.child("packageName").getValue(String::class.java)
+                            ?: return@observe,
+                        appLabel = snapshot.child("appLabel").getValue(String::class.java)
+                            ?: snapshot.child("packageName").getValue(String::class.java).orEmpty(),
+                        appStartedAt = snapshot.child("appStartedAt").getValue(Long::class.java) ?: 0L,
+                        overlayState = snapshot.child("overlayState").getValue(String::class.java)
+                            ?: "none",
+                        mediaTitle = snapshot.child("mediaTitle").getValue(String::class.java),
+                        mediaSubtitle = snapshot.child("mediaSubtitle").getValue(String::class.java),
+                        playbackState = snapshot.child("playbackState").getValue(String::class.java)
+                            ?: "unknown",
+                        positionMs = snapshot.child("positionMs").getValue(Long::class.java),
+                        durationMs = snapshot.child("durationMs").getValue(Long::class.java),
+                        positionCapturedAt = snapshot.child("positionCapturedAt").getValue(Long::class.java),
+                        playbackSpeed = snapshot.child("playbackSpeed").getValue(Double::class.java)
+                            ?.toFloat() ?: 0f,
+                        updatedAt = snapshot.child("updatedAt").getValue(Long::class.java) ?: 0L
+                    )
+                } else {
+                    null
+                }
+            )
+        }
+        observe(
+            database.child(FirebasePaths.deviceActivityHistory(deviceId))
+                .orderByChild("startedAt")
+                .limitToLast(200),
+            observer,
+            keepSynced = false
+        ) { snapshot ->
+            observer.onActivityHistory(snapshot.children.mapNotNull { child ->
+                val startedAt = child.child("startedAt").getValue(Long::class.java) ?: return@mapNotNull null
+                val endedAt = child.child("endedAt").getValue(Long::class.java) ?: return@mapNotNull null
+                ParentActivityRecord(
+                    id = child.key ?: return@mapNotNull null,
+                    type = child.child("type").getValue(String::class.java) ?: return@mapNotNull null,
+                    packageName = child.child("packageName").getValue(String::class.java)
+                        ?: return@mapNotNull null,
+                    appLabel = child.child("appLabel").getValue(String::class.java)
+                        ?: child.child("packageName").getValue(String::class.java).orEmpty(),
+                    title = child.child("title").getValue(String::class.java),
+                    subtitle = child.child("subtitle").getValue(String::class.java),
+                    startedAt = startedAt,
+                    endedAt = endedAt,
+                    durationMs = child.child("durationMs").getValue(Long::class.java),
+                    playbackState = child.child("playbackState").getValue(String::class.java),
+                    overlayMs = child.child("overlayMs").getValue(Long::class.java) ?: 0L
+                )
+            })
         }
         observe(FirebasePaths.deviceSyncDesired(deviceId), observer) { snapshot ->
             observer.onDesiredRevision(snapshot)
