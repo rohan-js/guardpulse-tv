@@ -664,6 +664,8 @@ test("TV writes activity telemetry and the paired parent reads it", async () => 
       durationMs: 60000,
       playbackState: "paused",
       confidence: "high",
+      overlayMs: 15000,
+      overlayStartedAt: 60,
       updatedAt: 70,
     })
   );

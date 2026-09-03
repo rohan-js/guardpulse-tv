@@ -9,6 +9,8 @@ import android.view.accessibility.AccessibilityNodeInfo
 import com.guardpulse.parentcontrol.shared.PolicyConstants
 import com.guardpulse.parentcontrol.tv.activity.MediaAccessibilityParser
 import com.guardpulse.parentcontrol.tv.activity.MediaBrowserProbe
+import com.guardpulse.parentcontrol.tv.activity.MediaSessionHub
+import com.guardpulse.parentcontrol.tv.activity.MediaTitlePolicy
 import com.guardpulse.parentcontrol.tv.activity.PlaybackAudioMonitor
 import com.guardpulse.parentcontrol.tv.activity.TvActivityTracker
 import com.guardpulse.parentcontrol.tv.policy.LocalPolicyStore
@@ -83,6 +85,20 @@ class AppMonitorAccessibilityService : AccessibilityService() {
                 activityTracker?.observeMediaBrowser(runtimePackage, title, subtitle, playbackState, positionMs, durationMs)
             }
         }
+        MediaSessionHub.setListener(object : MediaSessionHub.Listener {
+            override fun onSessionMedia(
+                runtimePackage: String,
+                title: String?,
+                subtitle: String?,
+                playbackState: String?,
+                positionMs: Long?,
+                durationMs: Long?
+            ) {
+                runCatching {
+                    activityTracker?.observeMediaSession(runtimePackage, title, subtitle, playbackState, positionMs, durationMs)
+                }
+            }
+        })
         mainHandler.post(foregroundPollRunnable)
     }
 
@@ -184,7 +200,7 @@ class AppMonitorAccessibilityService : AccessibilityService() {
         val tracker = activityTracker ?: return
         runCatching {
             val now = System.currentTimeMillis()
-            if (packageName in MediaAccessibilityParser.supportedPackages &&
+            if (MediaTitlePolicy.shouldWalkNodes(packageName, eventText, MediaSessionHub.sessionPackages) &&
                 now - lastNodeWalkAt >= MEDIA_NODE_WALK_MIN_INTERVAL_MS
             ) {
                 lastNodeWalkAt = now
@@ -288,6 +304,7 @@ class AppMonitorAccessibilityService : AccessibilityService() {
         }
         runCatching { audioMonitor?.stop() }
         disconnectMediaBrowserProbe()
+        MediaSessionHub.setListener(null)
         mainHandler.removeCallbacksAndMessages(null)
         super.onDestroy()
     }

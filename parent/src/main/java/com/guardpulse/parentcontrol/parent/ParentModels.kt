@@ -83,6 +83,7 @@ data class SecurityRuntime(
     val deviceAdminSetupAvailable: Boolean = true,
     val accessibility: Boolean = false,
     val usageAccess: Boolean = false,
+    val mediaTitlesEnabled: Boolean = false,
     val vpnPrepared: Boolean = false,
     val vpnActive: Boolean = false,
     val vpnBlockedCount: Int = 0,

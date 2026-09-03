@@ -189,6 +189,50 @@ class TvActivityTracker(private val context: Context) {
         return true
     }
 
+    fun observeMediaSession(
+        runtimePackage: String,
+        title: String?,
+        subtitle: String?,
+        playbackState: String?,
+        positionMs: Long?,
+        durationMs: Long?
+    ): Boolean {
+        val now = System.currentTimeMillis()
+        val current = loadCurrent() ?: return false
+        val policyPackage = PolicyConstants.sourceLockPolicyPackage(runtimePackage) ?: runtimePackage
+        if (current.packageName != policyPackage) return false
+        val nextTitle = title?.takeIf(String::isNotBlank) ?: current.mediaTitle
+        val nextSubtitle = subtitle?.takeIf(String::isNotBlank) ?: current.mediaSubtitle
+        val nextState = playbackState?.takeIf { it != MediaObservation.PLAYBACK_UNKNOWN } ?: current.playbackState
+        val nextPosition = positionMs ?: current.positionMs
+        val nextDuration = durationMs ?: current.durationMs
+        val nextSpeed = if (nextState == MediaObservation.PLAYBACK_PLAYING) 1f else 0f
+        val nextSource = combineCaptureSources(current.captureSource, MediaObservation.SOURCE_MEDIA_SESSION)
+        val changed = current.mediaTitle != nextTitle ||
+            current.mediaSubtitle != nextSubtitle ||
+            current.playbackState != nextState ||
+            current.positionMs != nextPosition ||
+            current.durationMs != nextDuration ||
+            current.playbackSpeed != nextSpeed ||
+            current.captureSource != nextSource
+        if (!changed) return false
+        persistCurrent(
+            current.copy(
+                mediaTitle = nextTitle,
+                mediaSubtitle = nextSubtitle,
+                playbackState = nextState,
+                positionMs = nextPosition,
+                durationMs = nextDuration,
+                playbackSpeed = nextSpeed,
+                captureSource = nextSource,
+                mediaStartedAt = current.mediaStartedAt ?: now,
+                mediaConfidence = strongerConfidence(current.mediaConfidence, MediaObservation.CONFIDENCE_HIGH),
+                updatedAt = now
+            )
+        )
+        return true
+    }
+
     fun refreshCurrentForUpload(now: Long = System.currentTimeMillis()) {
         val current = loadCurrent() ?: return
         persistCurrent(
@@ -337,8 +381,14 @@ class TvActivityTracker(private val context: Context) {
         node.text?.toString()?.takeIf(String::isNotBlank)?.let {
             output += AccessibilityTextNode(it, node.viewIdResourceName)
         }
+        // Content-descriptions often carry the media title where the text is a
+        // detail line (Nuvio: title in content-desc, "2h 1m" in text). Tag them
+        // with a dedicated marker so the parser can prefer them as title
+        // candidates without confusing plain text with view IDs.
         node.contentDescription?.toString()?.takeIf(String::isNotBlank)?.let {
-            output += AccessibilityTextNode(it, node.viewIdResourceName)
+            if (it != node.text?.toString()) {
+                output += AccessibilityTextNode(it, CONTENT_DESCRIPTION_VIEW_ID)
+            }
         }
         for (index in 0 until node.childCount) {
             node.getChild(index)?.let { child ->
@@ -371,5 +421,8 @@ class TvActivityTracker(private val context: Context) {
         private const val MIN_SESSION_MS = 2_000L
         private const val MIN_MEDIA_SESSION_MS = 3_000L
         private const val WINDOW_TITLE_VIEW_ID = "__window_title__"
+
+        /** Marker viewId for content-description nodes in title selection. */
+        const val CONTENT_DESCRIPTION_VIEW_ID = "__content_desc__"
     }
 }

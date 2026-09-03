@@ -33,6 +33,7 @@ import com.guardpulse.parentcontrol.shared.PolicyDecider
 import com.guardpulse.parentcontrol.shared.PolicyConstants
 import com.guardpulse.parentcontrol.shared.SyncDesiredRevision
 import com.guardpulse.parentcontrol.tv.activity.ActivityStore
+import com.guardpulse.parentcontrol.tv.activity.MediaSessionListenerService
 import com.guardpulse.parentcontrol.tv.MainActivity
 import com.guardpulse.parentcontrol.tv.R
 import com.guardpulse.parentcontrol.tv.apps.AppInventoryProvider
@@ -72,6 +73,7 @@ private data class ProbeSnapshot(
     val adminSetupAvailable: Boolean,
     val accessibility: Boolean,
     val usageAccess: Boolean,
+    val mediaTitlesEnabled: Boolean,
     val vpnStatus: com.guardpulse.parentcontrol.tv.network.NetworkFilterStatus,
     val backgroundUnrestricted: Boolean,
     val pinConfigured: Boolean,
@@ -1369,6 +1371,7 @@ class TvSyncService : Service() {
             "deviceAdminSetupAvailable" to probes.adminSetupAvailable,
             "accessibility" to probes.accessibility,
             "usageAccess" to probes.usageAccess,
+            "mediaTitlesEnabled" to probes.mediaTitlesEnabled,
             "vpnPrepared" to probes.vpnStatus.prepared,
             "vpnActive" to probes.vpnStatus.active,
             "vpnBlockedCount" to probes.vpnStatus.blockedCount,
@@ -1430,6 +1433,9 @@ class TvSyncService : Service() {
             adminSetupAvailable = FallbackProtection.isDeviceAdminSetupAvailable(this),
             accessibility = FallbackProtection.isAccessibilityEnabled(this),
             usageAccess = usageTracker.hasUsageAccess(),
+            mediaTitlesEnabled = runCatching {
+                MediaSessionListenerService.isEnabled(this)
+            }.getOrDefault(false),
             vpnStatus = NetworkFilterController.refreshPreparedStatus(this),
             backgroundUnrestricted = BackgroundRestrictionStatus.isBatteryUnrestricted(this),
             pinConfigured = pinRecord != null,

@@ -27,6 +27,7 @@ data class MediaObservation(
         const val SOURCE_ACCESSIBILITY = "accessibility"
         const val SOURCE_AUDIO = "audio"
         const val SOURCE_MEDIA_BROWSER = "mediaBrowser"
+        const val SOURCE_MEDIA_SESSION = "mediaSession"
         const val SOURCE_COMBINED = "combined"
     }
 }

@@ -60,7 +60,16 @@ object MediaAccessibilityParser {
         } else {
             null
         }
-        val title = titleNode?.text ?: packageSpecificTitle?.text
+        // Content-descriptions carry the title where text holds details
+        // (Nuvio movie cards: title in content-desc, "2h 1m" in text). They
+        // rank just below viewId-based titles and above the plain fallback.
+        val contentDescTitle = clean.firstOrNull { node ->
+            node.viewId == TvActivityTracker.CONTENT_DESCRIPTION_VIEW_ID &&
+                isTitleCandidate(node.text) &&
+                node.text.length in 3..120 &&
+                !timePattern.containsMatchIn(node.text)
+        }
+        val title = titleNode?.text ?: contentDescTitle?.text ?: packageSpecificTitle?.text
         val subtitle = clean.firstOrNull { node ->
             node.text != title &&
                 node.viewId?.lowercase()?.let { id -> subtitleIdHints.any(id::contains) } == true &&

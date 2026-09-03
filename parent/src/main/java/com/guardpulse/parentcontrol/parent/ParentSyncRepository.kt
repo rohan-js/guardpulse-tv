@@ -525,6 +525,7 @@ class ParentSyncRepository(private val database: DatabaseReference) {
         deviceAdminSetupAvailable = child("deviceAdminSetupAvailable").getValue(Boolean::class.java) ?: true,
         accessibility = child("accessibility").getValue(Boolean::class.java) ?: false,
         usageAccess = child("usageAccess").getValue(Boolean::class.java) ?: false,
+        mediaTitlesEnabled = child("mediaTitlesEnabled").getValue(Boolean::class.java) ?: false,
         vpnPrepared = child("vpnPrepared").getValue(Boolean::class.java) ?: false,
         vpnActive = child("vpnActive").getValue(Boolean::class.java) ?: false,
         vpnBlockedCount = child("vpnBlockedCount").getValue(Long::class.java)?.toInt() ?: 0,

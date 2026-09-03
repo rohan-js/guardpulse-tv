@@ -27,6 +27,7 @@ import com.guardpulse.parentcontrol.shared.DeviceIdentity
 import com.guardpulse.parentcontrol.shared.FirebaseBootstrap
 import com.guardpulse.parentcontrol.shared.FirebasePaths
 import com.guardpulse.parentcontrol.shared.PolicyConstants
+import com.guardpulse.parentcontrol.tv.activity.MediaSessionListenerService
 import com.guardpulse.parentcontrol.tv.fallback.FallbackProtection
 import com.guardpulse.parentcontrol.tv.fallback.FallbackStateStore
 import com.guardpulse.parentcontrol.tv.network.NetworkFilterController
@@ -101,6 +102,9 @@ class MainActivity : Activity() {
         val adminSetupAvailable = FallbackProtection.isDeviceAdminSetupAvailable(this)
         val accessibilityEnabled = FallbackProtection.isAccessibilityEnabled(this)
         val usageAccess = usageTracker.hasUsageAccess()
+        val mediaTitlesEnabled = runCatching {
+            MediaSessionListenerService.isEnabled(this)
+        }.getOrDefault(false)
         val vpnStatus = NetworkFilterController.refreshPreparedStatus(this)
         val backgroundUnrestricted = BackgroundRestrictionStatus.isBatteryUnrestricted(this)
         val pinConfigured = fallbackStore.loadPin() != null
@@ -163,7 +167,7 @@ class MainActivity : Activity() {
                 addView(LinearLayout(this@MainActivity).apply {
                     orientation = LinearLayout.VERTICAL
                     addView(section("Required Permissions"))
-                    addView(setupCard(firebaseStatus.configured, adminActive, adminSetupAvailable, accessibilityEnabled, usageAccess, vpnStatus, backgroundUnrestricted, pinConfigured))
+                    addView(setupCard(firebaseStatus.configured, adminActive, adminSetupAvailable, accessibilityEnabled, usageAccess, mediaTitlesEnabled, vpnStatus, backgroundUnrestricted, pinConfigured))
                     addView(diagnosticsCard(firebaseStatus.configured, adminActive, adminSetupAvailable, accessibilityEnabled, usageAccess, vpnStatus, backgroundUnrestricted, pinConfigured))
                 })
             })
@@ -471,6 +475,7 @@ class MainActivity : Activity() {
         adminSetupAvailable: Boolean,
         accessibilityEnabled: Boolean,
         usageAccess: Boolean,
+        mediaTitlesEnabled: Boolean,
         vpnStatus: NetworkFilterStatus,
         backgroundUnrestricted: Boolean,
         pinConfigured: Boolean
@@ -526,6 +531,25 @@ class MainActivity : Activity() {
                 safeStartActivity(
                     label = "Usage Access",
                     primary = FallbackProtection.usageAccessSettingsIntent(),
+                    fallback = Intent(Settings.ACTION_SETTINGS),
+                    fallbackLabel = "Android settings",
+                    allowProtectedSettings = true
+                )
+            })
+            addView(setupRow(
+                title = "Media Titles",
+                detail = if (mediaTitlesEnabled) {
+                    "Now Watching shows the actual video title, even in fullscreen."
+                } else {
+                    "Grant notification access once — it powers real video titles in the parent app. The kid cannot reach this screen."
+                },
+                ok = mediaTitlesEnabled,
+                actionText = if (mediaTitlesEnabled) "Enabled" else "Grant",
+                enabled = !mediaTitlesEnabled
+            ) {
+                safeStartActivity(
+                    label = "Media Titles",
+                    primary = Intent(android.provider.Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS),
                     fallback = Intent(Settings.ACTION_SETTINGS),
                     fallbackLabel = "Android settings",
                     allowProtectedSettings = true

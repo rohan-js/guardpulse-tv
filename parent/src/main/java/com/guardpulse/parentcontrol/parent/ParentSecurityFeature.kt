@@ -269,6 +269,7 @@ internal fun SecurityTab(
                 RuntimeRow(if (security.deviceAdminSetupAvailable) "Device Admin" else "Device Admin unavailable", if (security.deviceAdmin) "Active" else if (!security.deviceAdminSetupAvailable) "Unavailable" else "Needs setup", security.deviceAdmin || !security.deviceAdminSetupAvailable)
                 RuntimeRow("Accessibility", if (security.accessibility) "Active" else "Needs action", security.accessibility)
                 RuntimeRow("Usage Access", if (security.usageAccess) "Active" else "Needs action", security.usageAccess)
+                RuntimeRow("Media titles", if (security.mediaTitlesEnabled) "Active" else "Needs action", security.mediaTitlesEnabled)
                 RuntimeRow(
                     "Network Filter",
                     "Not required for app locks",

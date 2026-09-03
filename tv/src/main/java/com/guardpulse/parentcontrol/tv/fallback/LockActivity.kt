@@ -460,7 +460,18 @@ class LockActivity : Activity() {
     }
 
     private fun finishIfNoLongerBlocked() {
-        if (isSetupGate() || !::localPolicyStore.isInitialized) return
+        if (!::localPolicyStore.isInitialized) return
+        // The own-app (setup) gate honors remote approvals: when an approved
+        // unlock for our package exists, the wall must come down — the old
+        // early-return here trapped the parent after a remote approval.
+        if (isSetupGate()) {
+            if (fallbackStore.isAppVisitUnlocked(packageNameToUnlock) ||
+                fallbackStore.isTemporarilyUnlocked(packageNameToUnlock)
+            ) {
+                finishAndReturnToUnlockedTarget()
+            }
+            return
+        }
         if (fallbackStore.isSafeModeActive()) {
             finishAndReturnToUnlockedTarget()
             return

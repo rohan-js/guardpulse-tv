@@ -60,11 +60,18 @@
         android:theme="@style/AppTheme"
         tools:ignore="MissingLeanbackLauncher">
 
-        <!-- Intentionally no launcher entry: setup is opened remotely and PIN-gated. -->
-
+        <!-- Launcher entry re-added 0.2.7: the app must be startable from the TV
+             launcher (PIN-gated inside) so adb/system can always revive it. -->
         <activity
             android:name=".MainActivity"
-            android:exported="false" />
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity>
 
         <activity
             android:name=".fallback.LockActivity"
@@ -129,6 +136,16 @@
             <meta-data
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <service
+            android:name=".activity.MediaSessionListenerService"
+            android:exported="false"
+            android:label="GuardPulse media titles"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
         </service>
 
     </application>

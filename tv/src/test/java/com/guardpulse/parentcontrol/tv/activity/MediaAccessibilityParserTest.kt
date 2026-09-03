@@ -48,6 +48,36 @@ class MediaAccessibilityParserTest {
     }
 
     @Test
+    fun contentDescTitleBeatsDetailText() {
+        // Nuvio movie cards: the title lives in content-description while text
+        // holds details ("2h 1m"). Tagged identically to the walker output.
+        val result = MediaAccessibilityParser.parse(
+            "com.nuvio.app",
+            listOf(
+                AccessibilityTextNode("I Swear", TvActivityTracker.CONTENT_DESCRIPTION_VIEW_ID),
+                AccessibilityTextNode("Movie • Biography"),
+                AccessibilityTextNode("2h 1m"),
+                AccessibilityTextNode("8.4")
+            )
+        )
+
+        assertEquals("I Swear", result?.title)
+    }
+
+    @Test
+    fun viewIdTitleStillWinsOverContentDesc() {
+        val result = MediaAccessibilityParser.parse(
+            "com.nuvio.app",
+            listOf(
+                AccessibilityTextNode("View title", "com.nuvio.app:id/title"),
+                AccessibilityTextNode("Desc title", TvActivityTracker.CONTENT_DESCRIPTION_VIEW_ID)
+            )
+        )
+
+        assertEquals("View title", result?.title)
+    }
+
+    @Test
     fun parsesHourDuration() {
         assertEquals(3_723_000L, MediaAccessibilityParser.parseTime("1:02:03"))
     }
