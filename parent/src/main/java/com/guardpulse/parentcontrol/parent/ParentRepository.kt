@@ -63,6 +63,7 @@ class ParentRepository(
         onError: (String) -> Unit
     ) {
         val uid = requireUid(onError) ?: return
+        onQueuedWriteFailed = onError
         enqueueControlWrite {
             val revisionId = newRevisionId(deviceId)
             val control = mapOf<String, Any?>(
@@ -326,6 +327,7 @@ class ParentRepository(
         mutate: (MutableMap<String, Any?>) -> Unit
     ) {
         val uid = requireUid(onError) ?: return
+        onQueuedWriteFailed = onError
         enqueueControlWrite {
             val revisionId = newRevisionId(deviceId)
             val updates = mutableMapOf<String, Any?>()
@@ -394,8 +396,21 @@ class ParentRepository(
         if (controlWriteInFlight) return
         val next = controlWriteQueue.removeFirstOrNull() ?: return
         controlWriteInFlight = true
-        next()
+        // A SYNCHRONOUS throw from the write builder (bad key, requireUid, …)
+        // used to reset the flag but never run the operation's callbacks — the
+        // UI stayed "sending" for that op forever. Deliver a generic error.
+        try {
+            next()
+        } catch (e: Exception) {
+            controlWriteInFlight = false
+            onQueuedWriteFailed?.invoke(e.message ?: "Control update failed")
+            startNextControlWrite()
+        }
     }
+
+    // Set by the enqueueing operation so a synchronous failure can still reach
+    // ITS caller's onError (single-consumer queue: the front op is the one running).
+    private var onQueuedWriteFailed: ((String) -> Unit)? = null
 
     private fun com.google.android.gms.tasks.Task<Void>.finishQueuedWrite(
         onSuccess: () -> Unit,
@@ -406,6 +421,7 @@ class ParentRepository(
             .addOnFailureListener { onError(it.message ?: fallbackMessage) }
             .addOnCompleteListener {
                 controlWriteInFlight = false
+                onQueuedWriteFailed = null
                 startNextControlWrite()
             }
     }

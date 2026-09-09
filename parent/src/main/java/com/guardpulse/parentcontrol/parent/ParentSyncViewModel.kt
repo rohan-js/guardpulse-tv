@@ -533,6 +533,10 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     private fun clearSignedOutState() {
+        // A REMOTE sign-out lands here too (not just the button): without
+        // detaching, every observer fires onCancelled on a dead auth and the
+        // 5s→5min retry loop toasts errors forever.
+        syncRepository?.close()
         selectionPrefs.edit()
             .remove("selectedDeviceId")
             .remove("pendingPairDeviceId")

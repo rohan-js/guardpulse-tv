@@ -6,6 +6,7 @@ data class ControlAppRule(
     val packageName: String,
     val manualBlocked: Boolean = false,
     val dailyLimitMinutes: Int? = null,
+    val sessionLimitMinutes: Int? = null,
     val updatedAt: Long? = null
 )
 
@@ -268,10 +269,20 @@ object ControlProtocol {
             } else {
                 null
             }
+            val sessionSnapshot = appSnapshot.child("sessionLimitMinutes")
+            val sessionLimit = if (sessionSnapshot.exists()) {
+                val raw = sessionSnapshot.getValue(Long::class.java)
+                    ?: error("App session limit is invalid")
+                require(raw in 1L..1440L) { "App session limit is out of range" }
+                raw.toInt()
+            } else {
+                null
+            }
             packageName to ControlAppRule(
                 packageName = packageName,
                 manualBlocked = manualBlocked,
                 dailyLimitMinutes = limit,
+                sessionLimitMinutes = sessionLimit,
                 updatedAt = appSnapshot.child("updatedAt").getValue(Long::class.java)
             )
         }
@@ -283,6 +294,7 @@ private fun ControlAppRule.toFirebaseMap(packageKey: String): Map<String, Any?> 
     "packageName" to packageName,
     "manualBlocked" to manualBlocked,
     "dailyLimitMinutes" to dailyLimitMinutes,
+    "sessionLimitMinutes" to sessionLimitMinutes,
     "updatedAt" to updatedAt
 )
 
