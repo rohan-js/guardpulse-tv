@@ -6,7 +6,6 @@ import com.guardpulse.parentcontrol.shared.DeviceIdentity
 import com.guardpulse.parentcontrol.shared.PolicyConstants
 import com.guardpulse.parentcontrol.tv.security.SecureValueStore
 import com.guardpulse.parentcontrol.tv.system.SystemTimeGuard
-import java.security.MessageDigest
 import java.security.SecureRandom
 
 data class PairingState(
@@ -49,6 +48,19 @@ class PairingManager(private val context: Context) {
             return PairingState(DeviceIdentity.getOrCreate(context), existingCode, existingSecret, existingCreatedAt)
         }
 
+        // TTL boundary (or first mint): park the outgoing generation as the
+        // one-deep rotation-boundary grace BEFORE minting replacements. A QR
+        // scanned seconds before the boundary must still pair after it (see
+        // PairingGracePolicy for the 2x-TTL window math). Forced voids — unpair,
+        // brute-force lockout, expired-rejection — go through rotateCredentials(),
+        // which clears the grace instead: those must void ALL outstanding
+        // credentials.
+        if (!existingSecret.isNullOrBlank() && !existingCode.isNullOrBlank() && existingCreatedAt > 0L) {
+            secureStore.put("prevSecret", existingSecret)
+            secureStore.put("prevCode", existingCode)
+            prefs.edit().putLong("prevCreatedAt", existingCreatedAt).apply()
+        }
+
         val secretBytes = ByteArray(32)
         random.nextBytes(secretBytes)
         val secret = Base64.encodeToString(
@@ -63,12 +75,18 @@ class PairingManager(private val context: Context) {
     }
 
     fun isValid(secret: String?, code: String?, createdAt: Long): Boolean {
-        val state = current()
         val now = SystemTimeGuard.now()
-        if (createdAt <= 0 || now - createdAt > PolicyConstants.PAIRING_TTL_MS) return false
-        val secretMatches = !secret.isNullOrBlank() && constantTimeEquals(secret, state.secret)
-        val codeMatches = !code.isNullOrBlank() && constantTimeEquals(code, state.code)
-        val valid = secretMatches || codeMatches
+        val valid = PairingGracePolicy.isValid(
+            secret = secret,
+            code = code,
+            requestCreatedAt = createdAt,
+            now = now,
+            curSecret = secureStore.migratePlaintext("secret"),
+            curCode = secureStore.migratePlaintext("code"),
+            prevSecret = secureStore.get("prevSecret"),
+            prevCode = secureStore.get("prevCode"),
+            prevCreatedAt = prefs.getLong("prevCreatedAt", 0L)
+        )
         if (!valid) {
             // A 6-digit code is brute-forceable in principle; after enough bad
             // attempts rotate the credentials so every outstanding code/secret
@@ -117,21 +135,18 @@ class PairingManager(private val context: Context) {
     }
 
     fun rotateCredentials() {
+        // A forced void (unpair / brute-force lockout / expired rejection) must
+        // invalidate EVERY outstanding credential, including the grace copy.
         secureStore.put("secret", null)
         secureStore.put("code", null)
+        secureStore.put("prevSecret", null)
+        secureStore.put("prevCode", null)
         prefs.edit()
             .remove("secret")
             .remove("code")
             .remove("createdAt")
+            .remove("prevCreatedAt")
             .apply()
-    }
-
-    private fun constantTimeEquals(candidate: String, expected: String?): Boolean {
-        if (expected == null) return false
-        return MessageDigest.isEqual(
-            candidate.toByteArray(Charsets.UTF_8),
-            expected.toByteArray(Charsets.UTF_8)
-        )
     }
 
     private companion object {
