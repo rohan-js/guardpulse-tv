@@ -15,6 +15,10 @@ class FirebaseServerClock {
 
     @Volatile
     private var offsetMs: Long = 0L
+
+    /** True once the real server offset has arrived (before that, now() is raw device time). */
+    @Volatile
+    private var offsetReceived = false
     private var listener: ValueEventListener? = null
 
     fun start() {
@@ -24,6 +28,7 @@ class FirebaseServerClock {
         val valueListener = object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
                 offsetMs = snapshot.getValue(Long::class.java) ?: 0L
+                offsetReceived = true
             }
 
             override fun onCancelled(error: DatabaseError) = Unit
@@ -35,6 +40,8 @@ class FirebaseServerClock {
     fun now(): Long = System.currentTimeMillis() + offsetMs
 
     fun offsetMillis(): Long = offsetMs
+
+    fun offsetFresh(): Boolean = offsetReceived
 
     fun stop() {
         val database = database ?: return

@@ -195,6 +195,11 @@ class ParentRepository(
                 FirebasePaths.devicePolicyMode(deviceId, modeId),
                 FirebasePaths.deviceControlV2Mode(deviceId, modeId)
             ).forEach { path ->
+                // modeId must ride every write: the node validate requires it,
+                // so a rename into a not-yet-existing v2 node would otherwise be
+                // denied wholesale (leaf name/updatedAt alone fail hasChildren).
+                // When the node exists this is a no-op rewrite of the same value.
+                updates["$path/modeId"] = modeId
                 updates["$path/name"] = name
                 updates["$path/updatedAt"] = ServerValue.TIMESTAMP
                 updates["$path/updatedBy"] = auth.currentUser?.uid
@@ -260,10 +265,20 @@ class ParentRepository(
         onSuccess: () -> Unit,
         onError: (String) -> Unit
     ) {
+        if (!serverClock.offsetFresh()) {
+            // Without the real server offset, `until` derives from raw device
+            // time while startedAt resolves to true server time at commit; the
+            // rules reject until <= startedAt, denying the whole control write.
+            onError("Device clock is not synced yet — try again in a few seconds")
+            return
+        }
         val durationMs = durationMinutes.coerceIn(1, 1440) * 60_000L
+        // The rules reject until - startedAt > 24h; the max-duration value must
+        // leave headroom for the estimator/commit skew so the write always lands.
+        val effectiveMs = minOf(durationMs, MAX_SAFE_MODE_WINDOW_MS)
         val value = mapOf(
             "enabled" to true,
-            "until" to serverClock.now() + durationMs,
+            "until" to serverClock.now() + effectiveMs,
             "startedAt" to ServerValue.TIMESTAMP,
             "startedBy" to auth.currentUser?.uid
         )
@@ -315,7 +330,21 @@ class ParentRepository(
         onSuccess: () -> Unit,
         onError: (String) -> Unit
     ) {
-        sendCommand(deviceId, PolicyConstants.COMMAND_UNPAIR, null, onSuccess, onError)
+        val uid = requireUid(onError) ?: return
+        // Delete the parent's own mirror node immediately (rules permit it): the
+        // unpair command alone deadlocks removal when the TV is offline or dead,
+        // because commands expire and nothing else clears the device card. The
+        // command still goes out so a LIVE TV clears meta/ownerUid, which is
+        // required before it can ever be re-paired. If the TV comes online
+        // later, its redundant mirror delete is a rules-safe no-op.
+        database.child(FirebasePaths.userDevice(uid, deviceId))
+            .removeValue()
+            .addOnSuccessListener {
+                sendCommand(deviceId, PolicyConstants.COMMAND_UNPAIR, null, onSuccess, {
+                    onSuccess()
+                })
+            }
+            .addOnFailureListener { onError(it.message ?: "Device removal failed") }
     }
 
     private fun controlUpdate(
@@ -433,5 +462,12 @@ class ParentRepository(
     ) {
         addOnSuccessListener { onSuccess() }
             .addOnFailureListener { onError(it.message ?: fallbackMessage) }
+    }
+
+    companion object {
+        // Rules cap safe-mode windows at exactly 86,400,000 ms; capping the
+        // requested window one minute below leaves skew headroom so the write
+        // can never exceed the bound.
+        private const val MAX_SAFE_MODE_WINDOW_MS = 86_340_000L
     }
 }

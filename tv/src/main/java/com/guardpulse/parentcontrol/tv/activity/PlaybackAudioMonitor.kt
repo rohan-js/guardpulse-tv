@@ -18,9 +18,7 @@ class PlaybackAudioMonitor(
 
     private val callback = object : AudioManager.AudioPlaybackCallback() {
         override fun onPlaybackConfigChanged(configs: List<AudioPlaybackConfiguration>) {
-            val playing = configs.any { config ->
-                config.audioAttributes?.usage == AudioAttributes.USAGE_MEDIA
-            }
+            val playing = isMediaPlaying()
             if (!started || playing == lastPlaying) return
             lastPlaying = playing
             onPlaybackChanged(playing)
@@ -50,12 +48,25 @@ class PlaybackAudioMonitor(
     }
 
     private fun refreshFromCurrentState() {
-        val playing = audioManager
-            ?.activePlaybackConfigurations
-            ?.any { config ->
-                config.audioAttributes?.usage == AudioAttributes.USAGE_MEDIA
-            } == true
+        val playing = isMediaPlaying()
+        // Only emit real transitions: stamping a state at service connect would
+        // label whatever is foreground (launcher, a game) as paused/playing
+        // media without any evidence it ever played.
+        if (playing == lastPlaying) return
         lastPlaying = playing
         onPlaybackChanged(playing)
+    }
+
+    // A paused player keeps its AudioPlaybackConfiguration registered, and
+    // isActive() is a hidden system API not available to a public-SDK build —
+    // so "actually playing" is approximated as: a media-usage player exists AND
+    // the audio output is genuinely active (isMusicActive drops to false while
+    // paused), which stops paused videos extrapolating positions.
+    private fun isMediaPlaying(): Boolean {
+        val configs = audioManager?.activePlaybackConfigurations.orEmpty()
+        val mediaPlayerPresent = configs.any { config ->
+            config.audioAttributes?.usage == AudioAttributes.USAGE_MEDIA
+        }
+        return mediaPlayerPresent && audioManager?.isMusicActive == true
     }
 }

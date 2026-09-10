@@ -43,11 +43,14 @@ class ParentSyncRepository(private val database: DatabaseReference) {
         fun onError(message: String)
     }
 
-    private data class Registration(val query: Query, val listener: ValueEventListener)
+    private data class Registration(
+        val query: Query,
+        val listener: ValueEventListener,
+        val keepSynced: Boolean = false
+    )
 
     private val handler = Handler(Looper.getMainLooper())
     private val detailRegistrations = mutableListOf<Registration>()
-    private val keptSynced = mutableListOf<Query>()
     private var deviceRegistration: Registration? = null
     private var connectionRegistration: Registration? = null
     private var pairingRegistration: Registration? = null
@@ -427,10 +430,7 @@ class ParentSyncRepository(private val database: DatabaseReference) {
         onError: (String) -> Unit,
         onData: (DataSnapshot) -> Unit
     ): Registration {
-        if (keepSynced) {
-            query.keepSynced(true)
-            keptSynced += query
-        }
+        if (keepSynced) query.keepSynced(true)
         val listener = object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) = onData(snapshot)
 
@@ -440,7 +440,7 @@ class ParentSyncRepository(private val database: DatabaseReference) {
             }
         }
         query.addValueEventListener(listener)
-        return Registration(query, listener)
+        return Registration(query, listener, keepSynced)
     }
 
     private fun scheduleRetry() {
@@ -463,8 +463,6 @@ class ParentSyncRepository(private val database: DatabaseReference) {
     private fun clearDeviceDetails(clearSelection: Boolean = true) {
         detailRegistrations.forEach { it.remove() }
         detailRegistrations.clear()
-        keptSynced.forEach { it.keepSynced(false) }
-        keptSynced.clear()
         if (clearSelection) {
             currentDeviceId = null
             currentObserver = null
@@ -472,6 +470,11 @@ class ParentSyncRepository(private val database: DatabaseReference) {
     }
 
     private fun Registration.remove() {
+        // keepSynced rides the registration so every detach path (re-attach,
+        // sign-out close) also stops background sync of that query; the shared
+        // list previously left duplicates on refresh and let reattach's
+        // clearDeviceDetails kill the freshly-registered device list.
+        if (keepSynced) query.keepSynced(false)
         query.removeEventListener(listener)
     }
 

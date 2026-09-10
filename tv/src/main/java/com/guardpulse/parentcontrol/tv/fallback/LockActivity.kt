@@ -93,9 +93,18 @@ class LockActivity : Activity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        setIntent(intent)
-        detachRemoteListeners()
-        bindLockIntent(intent)
+        val sameTarget =
+            intent.getStringExtra(EXTRA_PACKAGE_NAME) == packageNameToUnlock &&
+                intent.getStringExtra(EXTRA_REASON) == reason &&
+                intent.getStringExtra(EXTRA_SETTINGS_SECTION_KEY) == settingsSectionKey
+        if (!sameTarget) {
+            setIntent(intent)
+            detachRemoteListeners()
+            bindLockIntent(intent)
+        }
+        // A same-target relaunch (dedupe-window expiry while the covered app
+        // keeps emitting events) must not clear the PIN entry or the pending
+        // remote request — the existing listeners are still attached.
         startAutoDismissChecks()
     }
 
@@ -148,17 +157,34 @@ class LockActivity : Activity() {
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (event.action != KeyEvent.ACTION_DOWN) return super.dispatchKeyEvent(event)
         return when (event.keyCode) {
-            KeyEvent.KEYCODE_0, KeyEvent.KEYCODE_NUMPAD_0 -> appendDigit("0")
-            KeyEvent.KEYCODE_1, KeyEvent.KEYCODE_NUMPAD_1 -> appendDigit("1")
-            KeyEvent.KEYCODE_2, KeyEvent.KEYCODE_NUMPAD_2 -> appendDigit("2")
-            KeyEvent.KEYCODE_3, KeyEvent.KEYCODE_NUMPAD_3 -> appendDigit("3")
-            KeyEvent.KEYCODE_4, KeyEvent.KEYCODE_NUMPAD_4 -> appendDigit("4")
-            KeyEvent.KEYCODE_5, KeyEvent.KEYCODE_NUMPAD_5 -> appendDigit("5")
-            KeyEvent.KEYCODE_6, KeyEvent.KEYCODE_NUMPAD_6 -> appendDigit("6")
-            KeyEvent.KEYCODE_7, KeyEvent.KEYCODE_NUMPAD_7 -> appendDigit("7")
-            KeyEvent.KEYCODE_8, KeyEvent.KEYCODE_NUMPAD_8 -> appendDigit("8")
-            KeyEvent.KEYCODE_9, KeyEvent.KEYCODE_NUMPAD_9 -> appendDigit("9")
-            KeyEvent.KEYCODE_DEL, KeyEvent.KEYCODE_CLEAR -> {
+            // Auto-repeat would flood the entry (a held digit types itself up to
+            // six times); only accept the initial press.
+            KeyEvent.KEYCODE_0, KeyEvent.KEYCODE_NUMPAD_0 ->
+                if (event.repeatCount == 0) appendDigit("0") else true
+            KeyEvent.KEYCODE_1, KeyEvent.KEYCODE_NUMPAD_1 ->
+                if (event.repeatCount == 0) appendDigit("1") else true
+            KeyEvent.KEYCODE_2, KeyEvent.KEYCODE_NUMPAD_2 ->
+                if (event.repeatCount == 0) appendDigit("2") else true
+            KeyEvent.KEYCODE_3, KeyEvent.KEYCODE_NUMPAD_3 ->
+                if (event.repeatCount == 0) appendDigit("3") else true
+            KeyEvent.KEYCODE_4, KeyEvent.KEYCODE_NUMPAD_4 ->
+                if (event.repeatCount == 0) appendDigit("4") else true
+            KeyEvent.KEYCODE_5, KeyEvent.KEYCODE_NUMPAD_5 ->
+                if (event.repeatCount == 0) appendDigit("5") else true
+            KeyEvent.KEYCODE_6, KeyEvent.KEYCODE_NUMPAD_6 ->
+                if (event.repeatCount == 0) appendDigit("6") else true
+            KeyEvent.KEYCODE_7, KeyEvent.KEYCODE_NUMPAD_7 ->
+                if (event.repeatCount == 0) appendDigit("7") else true
+            KeyEvent.KEYCODE_8, KeyEvent.KEYCODE_NUMPAD_8 ->
+                if (event.repeatCount == 0) appendDigit("8") else true
+            KeyEvent.KEYCODE_9, KeyEvent.KEYCODE_NUMPAD_9 ->
+                if (event.repeatCount == 0) appendDigit("9") else true
+            KeyEvent.KEYCODE_DEL -> {
+                pin = pin.dropLast(1)
+                updatePinDisplay()
+                true
+            }
+            KeyEvent.KEYCODE_CLEAR -> {
                 pin = ""
                 updatePinDisplay()
                 true
@@ -333,7 +359,7 @@ class LockActivity : Activity() {
                     setTextColor(Color.WHITE)
                     setOnClickListener {
                         when (label) {
-                            "DEL" -> pin = ""
+                            "DEL" -> pin = pin.dropLast(1)
                             "OK" -> checkPin()
                             else -> if (pin.length < 6) pin += label
                         }
@@ -525,6 +551,7 @@ class LockActivity : Activity() {
     }
 
     private fun writeRemoteUnlockRequest() {
+        if (isFinishing || isDestroyed) return
         val deviceId = DeviceIdentity.getOrCreate(this)
         val ref = FirebaseDatabase.getInstance().reference
             .child(FirebasePaths.deviceUnlockRequests(deviceId))
@@ -570,6 +597,7 @@ class LockActivity : Activity() {
     }
 
     private fun findExistingUnlockRequest() {
+        if (isFinishing || isDestroyed) return
         val deviceId = DeviceIdentity.getOrCreate(this)
         FirebaseDatabase.getInstance().reference
             .child(FirebasePaths.deviceUnlockRequests(deviceId))
@@ -577,6 +605,7 @@ class LockActivity : Activity() {
             .limitToLast(20)
             .addListenerForSingleValueEvent(object : ValueEventListener {
                 override fun onDataChange(snapshot: DataSnapshot) {
+                    if (isFinishing || isDestroyed) return
                     val newest = snapshot.children
                         .filter { child ->
                             child.child("packageName").getValue(String::class.java) == packageNameToUnlock
@@ -634,8 +663,18 @@ class LockActivity : Activity() {
                         )
                         finishAndReturnToUnlockedTarget()
                     }
-                    PolicyConstants.UNLOCK_DENIED -> statusText?.text = getString(R.string.lock_request_denied)
-                    PolicyConstants.UNLOCK_EXPIRED -> statusText?.text = getString(R.string.lock_request_expired)
+                    PolicyConstants.UNLOCK_DENIED -> {
+                        // Terminal: release the slot so "Ask parent" can create a
+                        // fresh request without re-binding the wall.
+                        requestId = null
+                        detachRemoteListeners()
+                        statusText?.text = getString(R.string.lock_request_denied)
+                    }
+                    PolicyConstants.UNLOCK_EXPIRED -> {
+                        requestId = null
+                        detachRemoteListeners()
+                        statusText?.text = getString(R.string.lock_request_expired)
+                    }
                 }
             }
 

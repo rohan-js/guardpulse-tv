@@ -42,6 +42,9 @@ class ActivityStore(context: Context) :
         if (oldVersion < 3) {
             db.execSQL("ALTER TABLE history ADD COLUMN overlay_ms INTEGER NOT NULL DEFAULT 0")
         }
+        // pre-3 installs never got this index (onCreate only); pruneBefore and
+        // the pendingHistory ordering both sort/filter on started_at. Idempotent.
+        db.execSQL("CREATE INDEX IF NOT EXISTS history_started_at ON history(started_at)")
     }
 
     @Synchronized

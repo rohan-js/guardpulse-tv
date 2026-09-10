@@ -2,6 +2,7 @@ package com.guardpulse.parentcontrol.parent
 
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.database.FirebaseDatabase
 import com.guardpulse.parentcontrol.shared.ControlPin
@@ -10,9 +11,12 @@ import com.guardpulse.parentcontrol.shared.ControlSnapshotV2
 import com.guardpulse.parentcontrol.shared.FirebaseRuntime
 import com.guardpulse.parentcontrol.shared.FirebaseServerClock
 import com.guardpulse.parentcontrol.shared.PolicyConstants
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 private sealed interface ControlOperation {
     data class UpdatePolicy(val packageName: String, val policy: ParentPolicy) : ControlOperation
@@ -82,6 +86,15 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
         serverClock.start()
         auth.addAuthStateListener(authListener)
         attachConnectionObserver()
+        // serverNow drives every staleness clock (TV badge, Now Watching, safe
+        // mode, usage interpolation); it must tick even when the TV stops
+        // writing sync/runtime, or the UI freezes instead of going stale.
+        viewModelScope.launch {
+            while (isActive) {
+                delay(SERVER_NOW_TICK_MS)
+                setState { it.copy(serverNow = serverClock.now()) }
+            }
+        }
         if (auth.currentUser != null) {
             attachDeviceList()
             resumePairRequestObserver()
@@ -710,5 +723,9 @@ class ParentSyncViewModel(application: Application) : AndroidViewModel(applicati
         syncRepository?.close()
         serverClock.stop()
         super.onCleared()
+    }
+
+    private companion object {
+        const val SERVER_NOW_TICK_MS = 5_000L
     }
 }

@@ -115,7 +115,7 @@ class LocalPolicyStore(context: Context) {
     }
 
     fun loadUsageOffsetsMs(): Map<String, Long> {
-        val day = DateKeys.today()
+        val day = DateKeys.dayKeyUtc(SystemTimeGuard.now())
         val key = "usageOffsetsMs:$day"
         synchronized(dayCacheLock) {
             usageOffsetsCache?.let { (cachedKey, cached) ->
@@ -126,11 +126,14 @@ class LocalPolicyStore(context: Context) {
         val loaded = if (existing != null) {
             parseLongMap(existing)
         } else {
+            // saveUsageOffsetMs has always written UTC day keys; the legacy
+            // minute-based family was written under device-local day keys, so
+            // fall back to both when the UTC key has nothing to migrate.
             val legacy = prefs.getString("usageOffsets:$day", null)
-                ?.let { parseLongMap(it) }
-                ?: emptyMap()
-            val migrated = legacy.mapValues { (_, minutes) -> minutes.coerceAtLeast(0L) * 60_000L }
-            if (legacy.isNotEmpty()) saveLongMap(key, migrated)
+                ?: prefs.getString("usageOffsets:${DateKeys.today()}", null)
+            val parsed = legacy?.let { parseLongMap(it) } ?: emptyMap()
+            val migrated = parsed.mapValues { (_, minutes) -> minutes.coerceAtLeast(0L) * 60_000L }
+            if (parsed.isNotEmpty()) saveLongMap(key, migrated)
             migrated
         }
         synchronized(dayCacheLock) { usageOffsetsCache = key to loaded }

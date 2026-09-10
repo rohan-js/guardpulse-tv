@@ -230,6 +230,10 @@ class TvSyncService : Service() {
         listenerRetryDelayMs = 5_000L
         lastSyncError = null
         db = FirebaseDatabase.getInstance().reference
+        // Fresh sign-in proves the auth path recovered; without this clean mark
+        // the "firebase" channel stays dirty forever after one transient sign-in
+        // failure and clearSyncError() can never fire.
+        markChannelSynced("firebase")
         // Capture the server-side state key set once so applyPoliciesAndUpload
         // can delete legacy debris it would otherwise never diff against.
         db?.child(FirebasePaths.deviceStateApps(deviceId))
@@ -590,6 +594,13 @@ class TvSyncService : Service() {
             recordSyncError(error.message ?: "Runtime session upload failed", "connection")
             return false
         }
+        // The successful runtime write proves auth + connection + RTDB writes all
+        // work again; engine channels re-dirty themselves if a listener is still
+        // genuinely broken (its onCancelled re-records).
+        markChannelSynced("connection")
+        markChannelSynced("firebase")
+        markChannelSynced("controlV2")
+        markChannelSynced("desiredRevision")
         pairingManager.pairedParentUid()?.let { parentUid ->
             registerParentMirrorOnDisconnect(parentUid)
         }
@@ -607,6 +618,9 @@ class TvSyncService : Service() {
         desired: SyncDesiredRevision?,
         generation: Long
     ) {
+        // A parsed snapshot reaching apply means the control channel recovered
+        // from any earlier parse rejection.
+        markChannelSynced("control")
         fallbackStore.saveServerTimeOffset(serverClock.offsetMillis())
         basePolicies = snapshot.apps.mapValues { (_, rule) ->
             AppPolicy(rule.manualBlocked, rule.dailyLimitMinutes)
@@ -651,7 +665,10 @@ class TvSyncService : Service() {
                     revisionId = snapshot.revisionId,
                     kind = PolicyConstants.REVISION_MIGRATION
                 ),
-                applyGeneration = generation
+                applyGeneration = generation,
+                // desired == null means sync/applied's rules validation can never
+                // pass for this revision; acking would deny the whole write.
+                allowAck = desired != null
             ) {
                 if (continuation.isActive) continuation.resume(Unit)
             }
@@ -792,6 +809,7 @@ class TvSyncService : Service() {
             ?.child("ownerUid")
             ?.addListenerForSingleValueEvent(object : ValueEventListener {
                 override fun onDataChange(snapshot: DataSnapshot) {
+                    markChannelSynced("pairing")
                     val ownerUid = snapshot.getValue(String::class.java)
                     if (!ownerUid.isNullOrBlank()) {
                         pairingManager.markPaired(ownerUid)
@@ -1040,7 +1058,10 @@ class TvSyncService : Service() {
         val commandId = snapshot.key ?: return
         val type = snapshot.child("type").getValue(String::class.java) ?: return
         val status = snapshot.child("status").getValue(String::class.java)
-        if (status != null && status != PolicyConstants.COMMAND_PENDING) return
+        if (status != null && status != PolicyConstants.COMMAND_PENDING) {
+            recoverStaleRunningCommand(snapshot, status)
+            return
+        }
         if (syncLocalStore.isCommandProcessed(commandId)) {
             snapshot.ref.updateChildren(
                 mapOf("status" to PolicyConstants.COMMAND_DONE, "completedAt" to ServerValue.TIMESTAMP)
@@ -1093,6 +1114,29 @@ class TvSyncService : Service() {
             },
             false
         )
+    }
+
+    /**
+     * A command claimed by a previous process that died before finishing stays
+     * `running` forever — handleCommand skips non-pending rows and nothing else
+     * revisits claims, and the parent cannot delete a running row. After the
+     * claim TTL lapses, rules permit running → failed, which unblocks the
+     * parent (retry or delete). Fresh claims are left alone so an in-flight
+     * command is never failed underneath the current process.
+     */
+    private fun recoverStaleRunningCommand(snapshot: DataSnapshot, status: String) {
+        if (status != PolicyConstants.COMMAND_RUNNING) return
+        val claimedAt = snapshot.child("claimedAt").getValue(Long::class.java) ?: 0L
+        if (claimedAt > 0L && serverClock.now() - claimedAt < STALE_RUNNING_COMMAND_TTL_MS) return
+        snapshot.ref.updateChildren(
+            mapOf(
+                "status" to PolicyConstants.COMMAND_FAILED,
+                "completedAt" to ServerValue.TIMESTAMP,
+                "error" to "Claimed command never finished; TV recovered it"
+            )
+        ).addOnFailureListener { error ->
+            recordSyncError(error.message ?: "Stale command recovery write failed", "command")
+        }
     }
 
     private fun processClaimedCommand(
@@ -1258,6 +1302,9 @@ class TvSyncService : Service() {
             }
             if (SystemTimeGuard.now() - lastActivityDbPruneAt > ACTIVITY_DB_PRUNE_INTERVAL_MS) {
                 lastActivityDbPruneAt = SystemTimeGuard.now()
+                // Local retention: pruneBefore previously had no callers, so the
+                // SQLite history grew unbounded for the life of the install.
+                runCatching { store.pruneBefore(SystemTimeGuard.now() - ACTIVITY_RETENTION_MS) }
                 val cutoff = (SystemTimeGuard.now() - ACTIVITY_RETENTION_MS).toDouble()
                 root.child(FirebasePaths.deviceActivityHistory(deviceId))
                     .orderByChild("startedAt")
@@ -1320,15 +1367,22 @@ class TvSyncService : Service() {
         db?.child(FirebasePaths.deviceHeartbeat(deviceId))?.updateChildren(heartbeat)
             ?.addOnSuccessListener {
                 markChannelSynced("heartbeat")
-                db?.child(FirebasePaths.deviceSyncRuntime(deviceId))?.updateChildren(
-                    mapOf(
-                        "connected" to firebaseConnected,
-                        "sessionId" to syncEngine?.currentSessionId(),
-                        "protocolVersion" to PolicyConstants.SYNC_PROTOCOL_VERSION,
-                        "lastHeartbeatWriteAt" to ServerValue.TIMESTAMP,
-                        "lastSuccessAt" to ServerValue.TIMESTAMP
-                    )
+                val runtime = mutableMapOf<String, Any?>(
+                    "lastHeartbeatWriteAt" to ServerValue.TIMESTAMP,
+                    "lastSuccessAt" to ServerValue.TIMESTAMP
                 )
+                // Publish session state only while the connection is confirmed
+                // live: a heartbeat that sat in the offline queue and completes
+                // around reconnect would otherwise transiently regress
+                // connected/sessionId and break the ack sessionId check.
+                if (firebaseConnected) {
+                    syncEngine?.currentSessionId()?.let { sessionId ->
+                        runtime["connected"] = true
+                        runtime["sessionId"] = sessionId
+                        runtime["protocolVersion"] = PolicyConstants.SYNC_PROTOCOL_VERSION
+                    }
+                }
+                db?.child(FirebasePaths.deviceSyncRuntime(deviceId))?.updateChildren(runtime)
             }
             ?.addOnFailureListener { error ->
                 recordSyncError(error.message ?: "Heartbeat upload failed", "heartbeat")
@@ -1475,6 +1529,7 @@ class TvSyncService : Service() {
         apps: List<TvInstalledApp> = currentInventory(),
         appliedRevision: SyncDesiredRevision? = null,
         applyGeneration: Long = 0L,
+        allowAck: Boolean = true,
         onComplete: ((Result<Unit>) -> Unit)? = null
     ) {
         expireSafeModeIfNeeded()
@@ -1629,7 +1684,13 @@ class TvSyncService : Service() {
             return
         }
         val appliedSessionId = syncEngine?.currentSessionId()
-        val shouldAcknowledge = appliedRevision != null &&
+        // sync/applied validation requires revisionId == sync/desired/revisionId;
+        // with desired absent (deleted, or not yet read) the ack child would deny
+        // the WHOLE multi-path update including every state child, freezing
+        // telemetry at backoff forever. Without a real desired revision, upload
+        // state only and let the next desired event drive a real ack.
+        val shouldAcknowledge = allowAck &&
+            appliedRevision != null &&
             !appliedSessionId.isNullOrBlank() &&
             (applyGeneration == 0L ||
                 syncEngine?.isCurrent(applyGeneration, appliedRevision.revisionId) == true)
@@ -1882,8 +1943,12 @@ class TvSyncService : Service() {
         private const val USAGE_UPLOAD_MIN_DELTA_MS = 30_000L
         private const val PROBE_CACHE_TTL_MS = 5 * 60_000L
         private const val HARDENING_INTERVAL_MS = 5 * 60_000L
-        private const val ACTIVITY_RETENTION_MS = 7L * 24 * 60 * 60_000
+        private const val ACTIVITY_RETENTION_MS = 30L * 24 * 60 * 60_000
         private const val ACTIVITY_DB_PRUNE_INTERVAL_MS = 24L * 60 * 60_000
+        // A claim older than this is by definition from a dead process (command
+        // TTLs cap at 10 min and every handler finishes or fails within one);
+        // running rows past it are failed so the parent can retry or delete.
+        private const val STALE_RUNNING_COMMAND_TTL_MS = 15L * 60 * 60_000
         private val TERMINAL_PAIR_STATUSES = setOf(
             PolicyConstants.PAIR_ACCEPTED,
             PolicyConstants.PAIR_REJECTED,

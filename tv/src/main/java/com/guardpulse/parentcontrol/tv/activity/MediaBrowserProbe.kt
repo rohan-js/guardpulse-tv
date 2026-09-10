@@ -33,12 +33,12 @@ class MediaBrowserProbe(
     private val controllerCallback = object : MediaController.Callback() {
         override fun onMetadataChanged(metadata: MediaMetadata?) {
             currentMetadata = metadata
-            emit()
+            runCatching { emit() }
         }
 
         override fun onPlaybackStateChanged(state: PlaybackState?) {
             currentState = state
-            emit()
+            runCatching { emit() }
         }
     }
 
@@ -57,13 +57,19 @@ class MediaBrowserProbe(
             component,
             object : MediaBrowser.ConnectionCallback() {
                 override fun onConnected() {
-                    val token = browser?.sessionToken ?: return
-                    controller = MediaController(appContext, token).also {
-                        it.registerCallback(controllerCallback)
-                    }
-                    currentMetadata = controller?.metadata
-                    currentState = controller?.playbackState
-                    emit()
+                    // IPC-backed reads (sessionToken/metadata/playbackState); the
+                    // media session can die mid-read. A throw here escapes the
+                    // connection callback and crashes the accessibility service
+                    // process — the only enforcement component.
+                    runCatching {
+                        val token = browser?.sessionToken ?: return
+                        controller = MediaController(appContext, token).also {
+                            it.registerCallback(controllerCallback)
+                        }
+                        currentMetadata = controller?.metadata
+                        currentState = controller?.playbackState
+                        emit()
+                    }.onFailure { disconnect() }
                 }
 
                 override fun onConnectionFailed() {

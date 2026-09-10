@@ -175,7 +175,22 @@ class MainActivity : Activity() {
                 orientation = LinearLayout.VERTICAL
                 layoutParams = LinearLayout.LayoutParams(dp(390), ViewGroup.LayoutParams.MATCH_PARENT)
                     .apply { leftMargin = dp(24) }
-                addView(pairingDashboardCard(pairing.deviceId, pairing.code, pairing.qrPayload))
+                if (pairing != null) {
+                    addView(pairingDashboardCard(pairing.deviceId, pairing.code, pairing.qrPayload))
+                } else {
+                    // Fail-closed mint failure (Keystore): never render a QR
+                    // whose credentials were not persisted.
+                    addView(section("Pairing unavailable").apply {
+                        textSize = 24f
+                        gravity = Gravity.CENTER
+                        setPadding(0, dp(24), 0, 0)
+                    })
+                    addView(body("Secure storage is unavailable, so a pairing code cannot be shown. Restart the TV app and try again.").apply {
+                        gravity = Gravity.CENTER
+                        textSize = 15f
+                        setPadding(0, dp(10), 0, 0)
+                    })
+                }
             })
         }
 

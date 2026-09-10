@@ -105,7 +105,8 @@ class AppMonitorAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val packageName = event?.packageName?.toString() ?: return
         if (!::localPolicyStore.isInitialized) return
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+        val isWindowTransition = event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+        if (isWindowTransition) {
             mainHandler.removeCallbacks(windowSettleRunnable)
             mainHandler.postDelayed(windowSettleRunnable, WINDOW_SETTLE_RECHECK_MS)
         }
@@ -113,7 +114,8 @@ class AppMonitorAccessibilityService : AccessibilityService() {
             packageName = packageName,
             eventClassName = event.className,
             eventText = event.text,
-            root = rootInActiveWindow
+            root = rootInActiveWindow,
+            isWindowTransition = isWindowTransition
         )
         lastEventHandledAt = System.currentTimeMillis()
     }
@@ -128,7 +130,8 @@ class AppMonitorAccessibilityService : AccessibilityService() {
             packageName = packageName,
             eventClassName = root?.className,
             eventText = emptyList(),
-            root = root
+            root = root,
+            isWindowTransition = true
         )
     }
 
@@ -136,22 +139,29 @@ class AppMonitorAccessibilityService : AccessibilityService() {
         packageName: String,
         eventClassName: CharSequence?,
         eventText: List<CharSequence>,
-        root: AccessibilityNodeInfo?
+        root: AccessibilityNodeInfo?,
+        isWindowTransition: Boolean
     ) {
         fallbackStore.saveLastForeground(packageName)
         trackLiveForeground(packageName)
-        clearSetupVisitUnlockIfLeft(packageName)
-        clearAppVisitUnlockIfLeft(packageName)
+        clearSetupVisitUnlockIfLeft(packageName, isWindowTransition)
+        clearAppVisitUnlockIfLeft(packageName, isWindowTransition)
         val settingsSection = SettingsSectionDetector.detect(
             packageName = packageName,
             eventClassName = eventClassName,
             eventText = eventText,
             root = root
         )
-        if (settingsSection == null && packageName in PolicyConstants.primarySettingsPackages) {
-            fallbackStore.clearSettingsSectionUnlock()
-        }
-        if (packageName !in PolicyConstants.primarySettingsPackages && packageName != this.packageName) {
+        // Section unlocks clear on leaving Settings (or GuardPulse flow) only —
+        // never on a detector miss while still inside Settings: the text
+        // heuristics return null on overlays, dense grids, and node-budget
+        // exhaustion, and clearing there re-locks mid-visit and funnels the next
+        // PIN entry through the whole-Settings wall.
+        if (packageName !in PolicyConstants.primarySettingsPackages &&
+            packageName != this.packageName &&
+            packageName != TRANSPARENT_OVERLAY_PACKAGE &&
+            isWindowTransition
+        ) {
             fallbackStore.clearSettingsSectionUnlock()
         }
 
@@ -168,7 +178,8 @@ class AppMonitorAccessibilityService : AccessibilityService() {
             settingsSection = settingsSection
         )
         val now = System.currentTimeMillis()
-        val launch = lockLaunchGuard.evaluate(packageName, decision, now) ?: run {
+        val isOwnPackage = packageName == this.packageName
+        val launch = lockLaunchGuard.evaluate(packageName, decision, now, isOwnPackage) ?: run {
             trackActivity(packageName, eventClassName, eventText, root)
             return
         }
@@ -282,17 +293,19 @@ class AppMonitorAccessibilityService : AccessibilityService() {
         return policyPackage
     }
 
-    private fun clearAppVisitUnlockIfLeft(packageName: String) {
+    private fun clearAppVisitUnlockIfLeft(packageName: String, isWindowTransition: Boolean) {
+        if (!isWindowTransition) return
         val unlockedPolicyPackage = fallbackStore.appVisitUnlockPackage() ?: return
-        if (packageName == this.packageName) return
+        if (packageName == this.packageName || packageName == TRANSPARENT_OVERLAY_PACKAGE) return
         val currentPolicyPackage = PolicyConstants.sourceLockPolicyPackage(packageName) ?: packageName
         if (currentPolicyPackage != unlockedPolicyPackage) {
             fallbackStore.clearAppVisitUnlock()
         }
     }
 
-    private fun clearSetupVisitUnlockIfLeft(packageName: String) {
-        if (packageName != this.packageName) {
+    private fun clearSetupVisitUnlockIfLeft(packageName: String, isWindowTransition: Boolean) {
+        if (!isWindowTransition) return
+        if (packageName != this.packageName && packageName != TRANSPARENT_OVERLAY_PACKAGE) {
             fallbackStore.clearSetupVisitUnlock()
         }
     }
@@ -326,5 +339,10 @@ class AppMonitorAccessibilityService : AccessibilityService() {
         private const val POLL_EVENT_GRACE_MS = 1_500L
         private const val WINDOW_SETTLE_RECHECK_MS = 300L
         private const val MEDIA_NODE_WALK_MIN_INTERVAL_MS = 750L
+
+        // Volume/PiP overlay windows report com.android.systemui as the event
+        // source while the user is still inside the unlocked app; treating them
+        // as app exits would kill one-visit unlocks mid-usage.
+        private const val TRANSPARENT_OVERLAY_PACKAGE = "com.android.systemui"
     }
 }

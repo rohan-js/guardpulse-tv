@@ -164,16 +164,24 @@ class TvActivityTracker(private val context: Context) {
         val nextDuration = durationMs ?: current.durationMs
         val nextSpeed = if (nextState == MediaObservation.PLAYBACK_PLAYING) 1f else 0f
         val nextSource = combineCaptureSources(current.captureSource, MediaObservation.SOURCE_MEDIA_BROWSER)
-        val changed = current.mediaTitle != nextTitle ||
-            current.mediaSubtitle != nextSubtitle ||
-            current.playbackState != nextState ||
-            current.positionMs != nextPosition ||
-            current.durationMs != nextDuration ||
-            current.playbackSpeed != nextSpeed ||
-            current.captureSource != nextSource
+        // A genuinely new title starts a new media session — same rule as the
+        // accessibility path, so an autoplaying playlist does not become one
+        // giant session that carries the first episode's start time.
+        var base = current
+        if (base.mediaTitle != null && nextTitle != null && base.mediaTitle != nextTitle) {
+            closeMediaSession(base, now)
+            base = base.clearMedia()
+        }
+        val changed = base.mediaTitle != nextTitle ||
+            base.mediaSubtitle != nextSubtitle ||
+            base.playbackState != nextState ||
+            base.positionMs != nextPosition ||
+            base.durationMs != nextDuration ||
+            base.playbackSpeed != nextSpeed ||
+            base.captureSource != nextSource
         if (!changed) return false
         persistCurrent(
-            current.copy(
+            base.copy(
                 mediaTitle = nextTitle,
                 mediaSubtitle = nextSubtitle,
                 playbackState = nextState,
@@ -181,8 +189,8 @@ class TvActivityTracker(private val context: Context) {
                 durationMs = nextDuration,
                 playbackSpeed = nextSpeed,
                 captureSource = nextSource,
-                mediaStartedAt = current.mediaStartedAt ?: now,
-                mediaConfidence = strongerConfidence(current.mediaConfidence, MediaObservation.CONFIDENCE_HIGH),
+                mediaStartedAt = base.mediaStartedAt ?: now,
+                mediaConfidence = strongerConfidence(base.mediaConfidence, MediaObservation.CONFIDENCE_HIGH),
                 updatedAt = now
             )
         )
@@ -208,16 +216,21 @@ class TvActivityTracker(private val context: Context) {
         val nextDuration = durationMs ?: current.durationMs
         val nextSpeed = if (nextState == MediaObservation.PLAYBACK_PLAYING) 1f else 0f
         val nextSource = combineCaptureSources(current.captureSource, MediaObservation.SOURCE_MEDIA_SESSION)
-        val changed = current.mediaTitle != nextTitle ||
-            current.mediaSubtitle != nextSubtitle ||
-            current.playbackState != nextState ||
-            current.positionMs != nextPosition ||
-            current.durationMs != nextDuration ||
-            current.playbackSpeed != nextSpeed ||
-            current.captureSource != nextSource
+        var base = current
+        if (base.mediaTitle != null && nextTitle != null && base.mediaTitle != nextTitle) {
+            closeMediaSession(base, now)
+            base = base.clearMedia()
+        }
+        val changed = base.mediaTitle != nextTitle ||
+            base.mediaSubtitle != nextSubtitle ||
+            base.playbackState != nextState ||
+            base.positionMs != nextPosition ||
+            base.durationMs != nextDuration ||
+            base.playbackSpeed != nextSpeed ||
+            base.captureSource != nextSource
         if (!changed) return false
         persistCurrent(
-            current.copy(
+            base.copy(
                 mediaTitle = nextTitle,
                 mediaSubtitle = nextSubtitle,
                 playbackState = nextState,
@@ -225,8 +238,8 @@ class TvActivityTracker(private val context: Context) {
                 durationMs = nextDuration,
                 playbackSpeed = nextSpeed,
                 captureSource = nextSource,
-                mediaStartedAt = current.mediaStartedAt ?: now,
-                mediaConfidence = strongerConfidence(current.mediaConfidence, MediaObservation.CONFIDENCE_HIGH),
+                mediaStartedAt = base.mediaStartedAt ?: now,
+                mediaConfidence = strongerConfidence(base.mediaConfidence, MediaObservation.CONFIDENCE_HIGH),
                 updatedAt = now
             )
         )
@@ -245,7 +258,10 @@ class TvActivityTracker(private val context: Context) {
     }
 
     fun observePackageOnly(runtimePackage: String): Boolean {
-        if (runtimePackage == context.packageName || runtimePackage == "com.android.systemui") return false
+        // Own-package events must reach observe(): the PIN wall being foreground
+        // is exactly how overlayState=locked gets recorded (and folded back into
+        // overlayMs when the wall leaves). Only transient systemui windows skip.
+        if (runtimePackage == "com.android.systemui") return false
         return observe(runtimePackage, null, emptyList(), emptyList(), null)
     }
 

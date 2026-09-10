@@ -35,7 +35,13 @@ class PairingManager(private val context: Context) {
     @Volatile
     private var parentUidLoaded = false
 
-    fun current(): PairingState {
+    /**
+     * Returns the current pairing credentials, or null when a new generation
+     * could not be persisted. Null is fail-closed: a QR whose secret/code were
+     * never stored can never validate, and showing it would feed the brute-force
+     * rotation counter with false failures (see isValid).
+     */
+    fun current(): PairingState? {
         val now = SystemTimeGuard.now()
         val existingSecret = secureStore.migratePlaintext("secret")
         val existingCode = secureStore.migratePlaintext("code")
@@ -68,8 +74,14 @@ class PairingManager(private val context: Context) {
             Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING
         )
         val code = (100000 + random.nextInt(900000)).toString()
-        secureStore.put("secret", secret)
-        secureStore.put("code", code)
+        val secretSaved = secureStore.put("secret", secret)
+        val codeSaved = secretSaved && secureStore.put("code", code)
+        if (!secretSaved || !codeSaved) {
+            // Roll back a half-written generation so the next call re-mints
+            // instead of returning the parked grace as current credentials.
+            if (secretSaved) secureStore.put("secret", null)
+            return null
+        }
         prefs.edit().putLong("createdAt", now).apply()
         return PairingState(DeviceIdentity.getOrCreate(context), code, secret, now)
     }

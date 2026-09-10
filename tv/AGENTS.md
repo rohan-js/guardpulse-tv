@@ -21,11 +21,19 @@ affect BOTH clients and possibly the deployed Firebase rules.
 
 ## Current shipped state
 
-- TV: **0.2.7 (versionCode 9)**, commit `e2db520`, INSTALLED and live-verified
-  on the TV at `192.168.1.9:5555` (device id `38763e9b-521b-4414-90ba-ef7bb155d58d`).
-- Firebase project `rithik-parental-control`; rules in `firebase/` are DEPLOYED
-  and byte-accurate to what the live DB enforces.
-- 45 TV unit tests green (`./gradlew :tv:testDebugUnitTest`).
+- TV: **0.2.8 (versionCode 10)** — the 2026-09-09 full-codebase audit fix set
+  (see `../PROJECT_CONTEXT.md`, section "Authoritative Continuation Handoff (2026-09-03)"
+  plus the audit section). Parent: 0.3.2 (versionCode 5, built but NOT yet
+  installed on the phone).
+- TV 0.2.8 was INSTALLED on the TV at `192.168.1.6:5555` on 2026-09-10
+  (device id `38763e9b-521b-4414-90ba-ef7bb155d58d`) via assembleRelease →
+  zipalign → debug-keystore apksigner → `adb install -r`; data/pairing
+  preserved, services + heartbeat verified after install.
+- Firebase project `rithik-parental-control`; the hardened rules
+  (`sessionLimitMinutes` declarations, legacy `policy/*` `$other` guards,
+  tamperEvents TV-delete restriction) were DEPLOYED on 2026-09-10 and verified
+  live (heartbeat writes landing, legacy policy nodes readable).
+- TV unit tests green (`./gradlew :tv:testDebugUnitTest`).
 - Full handoff with release-by-release details: `../PROJECT_CONTEXT.md`,
   section "Authoritative Continuation Handoff (2026-09-03)".
 
@@ -86,10 +94,17 @@ affect BOTH clients and possibly the deployed Firebase rules.
   `FallbackProtection.shouldLock` → `LockLaunchGuard` (1.5s dedupe) → opens
   `LockActivity`. Also feeds `TvActivityTracker` (media titles) and live usage
   sessions. Poll safety-net every 1s; 300ms settle recheck after
-  TYPE_WINDOW_STATE_CHANGED.
+  TYPE_WINDOW_STATE_CHANGED. Since 0.2.8: Settings-section unlock clears only on
+  a real window transition leaving Settings (never on a detector miss — a miss
+  used to re-lock mid-visit and hand out a whole-Settings one-visit unlock via
+  the fallback wall); `com.android.systemui` events never count as "left the
+  app" for unlock clearing; own-package not-locked decisions do not reset the
+  LockLaunchGuard dedupe key (the covered app's content events used to relaunch
+  the wall and wipe the PIN being typed).
 - `tv/fallback/LockActivity.kt`: PIN wall. Binds remote unlock listeners on
-  EVERY bind (onCreate + onNewIntent); auto-dismiss poll (750ms) honors
-  unlocks; BACK swallowed; singleTask.
+  EVERY bind (onCreate + onNewIntent); same-target onNewIntent is a no-op
+  rebind (keeps PIN entry + pending request); auto-dismiss poll (750ms) honors
+  unlocks; BACK swallowed; singleTask. DEL backspaces one digit, CLEAR wipes.
 - `tv/fallback/FallbackStateStore.kt`: unlock grants (temp/app-visit/
   per-section), PIN record (Keystore via SecureValueStore, fail-closed on
   corruption), admin-disable gate, safe mode (server-time hardened).

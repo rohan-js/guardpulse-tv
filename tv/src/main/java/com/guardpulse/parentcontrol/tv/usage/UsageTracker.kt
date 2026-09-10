@@ -35,7 +35,12 @@ class UsageTracker(private val context: Context) {
         }
         // Usage day = UTC day of the guarded clock, matching the day keys used by
         // the local ledger and dailyBlocks; the query window starts at that day's
-        // UTC midnight so a timezone shift cannot reset the daily limit.
+        // UTC midnight so a timezone shift cannot reset the daily limit. The
+        // window END must be >= start: after a clock rollback the guarded clock
+        // runs ahead of the device clock, and usage recorded pre-rollback carries
+        // device-clock timestamps beyond the rolled-back `now` — capping the end
+        // at the device clock would drop it (and an inverted window returns
+        // nothing at all).
         val start = Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply {
             timeInMillis = SystemTimeGuard.now()
             set(Calendar.HOUR_OF_DAY, 0)
@@ -43,7 +48,8 @@ class UsageTracker(private val context: Context) {
             set(Calendar.SECOND, 0)
             set(Calendar.MILLISECOND, 0)
         }.timeInMillis
-        val stats = usageStatsManager.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, start, now)
+        val end = maxOf(now, SystemTimeGuard.now())
+        val stats = usageStatsManager.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, start, end)
         val usageByPackage = mutableMapOf<String, Long>()
         stats
             .filter { it.totalTimeInForeground > 0 }
