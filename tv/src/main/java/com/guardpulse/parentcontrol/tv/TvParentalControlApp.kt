@@ -31,7 +31,12 @@ class TvParentalControlApp : Application() {
         ).build()
         WorkManager.getInstance(this).enqueueUniquePeriodicWork(
             "policy-reconcile",
-            ExistingPeriodicWorkPolicy.UPDATE,
+            // KEEP, not UPDATE: UPDATE resets the 15-minute schedule on EVERY
+            // process start, so a TV whose process restarts more often than
+            // every 15 minutes could starve the reconcile worker entirely.
+            // The request spec never changes; StrictProtectionStarter.recover
+            // below still runs a full pass on every start.
+            ExistingPeriodicWorkPolicy.KEEP,
             work
         )
         runCatching { StrictProtectionStarter.recover(this) }

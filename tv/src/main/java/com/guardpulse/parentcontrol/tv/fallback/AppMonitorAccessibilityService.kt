@@ -1,6 +1,7 @@
 package com.guardpulse.parentcontrol.tv.fallback
 
 import android.accessibilityservice.AccessibilityService
+import android.content.BroadcastReceiver
 import android.content.SharedPreferences
 import android.os.Handler
 import android.os.Looper
@@ -14,8 +15,10 @@ import com.guardpulse.parentcontrol.tv.activity.MediaTitlePolicy
 import com.guardpulse.parentcontrol.tv.activity.PlaybackAudioMonitor
 import com.guardpulse.parentcontrol.tv.activity.TvActivityTracker
 import com.guardpulse.parentcontrol.tv.policy.LocalPolicyStore
+import com.guardpulse.parentcontrol.tv.system.ScreenState
 import com.guardpulse.parentcontrol.tv.system.SystemTimeGuard
 import com.guardpulse.parentcontrol.tv.system.TvServiceStarter
+import com.guardpulse.parentcontrol.tv.system.registerScreenStateReceiver
 import com.guardpulse.parentcontrol.tv.sync.TvSyncService
 import com.guardpulse.parentcontrol.tv.sync.TamperEventQueue
 import com.guardpulse.parentcontrol.tv.usage.UsageTracker
@@ -34,15 +37,20 @@ class AppMonitorAccessibilityService : AccessibilityService() {
     private var audioMonitor: PlaybackAudioMonitor? = null
     private var mediaBrowserProbe: MediaBrowserProbe? = null
     private var lastNodeWalkAt = 0L
+    private var screenStateReceiver: BroadcastReceiver? = null
 
     private val foregroundPollRunnable = object : Runnable {
         override fun run() {
             // Events keep the foreground evaluation warm; the poll is only a
             // safety net for when they stop flowing, so skip while one landed recently.
-            if (System.currentTimeMillis() - lastEventHandledAt >= POLL_EVENT_GRACE_MS) {
+            val now = System.currentTimeMillis()
+            if (now - lastEventHandledAt >= POLL_EVENT_GRACE_MS) {
                 evaluateCurrentWindow()
             }
-            mainHandler.postDelayed(this, FOREGROUND_RECHECK_MS)
+            // After a minute of total event silence (screen off, idle launcher)
+            // relax the safety net to one pass every 5 s; any event restores 1 s.
+            val idle = now - lastEventHandledAt >= POLL_IDLE_AFTER_MS
+            mainHandler.postDelayed(this, if (idle) POLL_IDLE_RECHECK_MS else FOREGROUND_RECHECK_MS)
         }
     }
 
@@ -99,29 +107,62 @@ class AppMonitorAccessibilityService : AccessibilityService() {
                 }
             }
         })
+        screenStateReceiver = registerScreenStateReceiver(this) { off ->
+            mainHandler.post { onScreenStateChanged(off) }
+        }
         mainHandler.post(foregroundPollRunnable)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val packageName = event?.packageName?.toString() ?: return
         if (!::localPolicyStore.isInitialized) return
+        if (ScreenState.off) {
+            // An event while the display is off means the screen actually woke
+            // without a broadcast; clear the flag (so the sync tick resumes its
+            // full passes) and restart the loop, then process this event.
+            ScreenState.off = false
+            onScreenStateChanged(false)
+        }
         val isWindowTransition = event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
         if (isWindowTransition) {
             mainHandler.removeCallbacks(windowSettleRunnable)
             mainHandler.postDelayed(windowSettleRunnable, WINDOW_SETTLE_RECHECK_MS)
         }
+        // rootInActiveWindow is an IPC; only the Settings-section detector and
+        // the rate-limited media node walk actually consume it.
+        val needsRoot = packageName in PolicyConstants.primarySettingsPackages ||
+            (MediaTitlePolicy.shouldWalkNodes(packageName, event.text, MediaSessionHub.sessionPackages) &&
+                System.currentTimeMillis() - lastNodeWalkAt >= MEDIA_NODE_WALK_MIN_INTERVAL_MS)
         evaluateForeground(
             packageName = packageName,
             eventClassName = event.className,
             eventText = event.text,
-            root = rootInActiveWindow,
+            root = if (needsRoot) rootInActiveWindow else null,
             isWindowTransition = isWindowTransition
         )
         lastEventHandledAt = System.currentTimeMillis()
     }
 
+    private fun onScreenStateChanged(off: Boolean) {
+        if (off) {
+            // Display off: stop the poll loop and release the media probe.
+            // Finalizing the session while paused would count the whole dark
+            // period as app usage, so the session is simply frozen and resumes
+            // on the next real event / SCREEN_ON.
+            mainHandler.removeCallbacks(foregroundPollRunnable)
+            mainHandler.removeCallbacks(windowSettleRunnable)
+            disconnectMediaBrowserProbe()
+        } else {
+            mainHandler.removeCallbacks(foregroundPollRunnable)
+            lastEventHandledAt = 0L
+            mainHandler.post(foregroundPollRunnable)
+            evaluateCurrentWindow()
+        }
+    }
+
     private fun evaluateCurrentWindow() {
         if (!::localPolicyStore.isInitialized) return
+        if (ScreenState.off) return
         val root = rootInActiveWindow
         val packageName = root?.packageName?.toString()
             ?: fallbackStore.lastForeground()
@@ -223,6 +264,10 @@ class AppMonitorAccessibilityService : AccessibilityService() {
     }
 
     private fun trackLiveForeground(packageName: String) {
+        // A volume/PiP overlay window is not leaving the app: finalizing here
+        // would disconnect the probe, fire a reconcile and restart the usage
+        // session on every overlay blink during playback.
+        if (packageName == TRANSPARENT_OVERLAY_PACKAGE) return
         val usagePackage = usagePolicyPackage(packageName)
         val current = fallbackStore.liveForegroundSession()
         if (usagePackage == null) {
@@ -315,6 +360,8 @@ class AppMonitorAccessibilityService : AccessibilityService() {
         if (::localPolicyStore.isInitialized) {
             localPolicyStore.unregisterChangeListener(policyChangeListener)
         }
+        screenStateReceiver?.let { runCatching { unregisterReceiver(it) } }
+        screenStateReceiver = null
         runCatching { audioMonitor?.stop() }
         disconnectMediaBrowserProbe()
         MediaSessionHub.setListener(null)
@@ -335,6 +382,9 @@ class AppMonitorAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val FOREGROUND_RECHECK_MS = 1_000L
+        // After this much event silence the poll relaxes to one pass per 5 s.
+        private const val POLL_IDLE_AFTER_MS = 60_000L
+        private const val POLL_IDLE_RECHECK_MS = 5_000L
         private const val LIVE_LIMIT_CHECK_MS = 5_000L
         private const val POLL_EVENT_GRACE_MS = 1_500L
         private const val WINDOW_SETTLE_RECHECK_MS = 300L

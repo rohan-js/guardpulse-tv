@@ -26,8 +26,8 @@ android {
         applicationId = "com.guardpulse.parentcontrol.tv"
         minSdk = 26
         targetSdk = 34
-        versionCode = providers.gradleProperty("guardpulse.versionCode").orElse("10").get().toInt()
-        versionName = providers.gradleProperty("guardpulse.versionName").orElse("0.2.8").get()
+        versionCode = providers.gradleProperty("guardpulse.versionCode").orElse("11").get().toInt()
+        versionName = providers.gradleProperty("guardpulse.versionName").orElse("0.2.9").get()
     }
 
     signingConfigs {

@@ -48,6 +48,7 @@ import com.guardpulse.parentcontrol.tv.policy.AppPolicy
 import com.guardpulse.parentcontrol.tv.policy.DevicePolicyController
 import com.guardpulse.parentcontrol.tv.policy.LocalPolicyStore
 import com.guardpulse.parentcontrol.tv.system.BackgroundRestrictionStatus
+import com.guardpulse.parentcontrol.tv.system.ScreenState
 import com.guardpulse.parentcontrol.tv.system.SystemTimeGuard
 import com.guardpulse.parentcontrol.tv.usage.UsageTracker
 import kotlin.coroutines.resume
@@ -108,6 +109,7 @@ class TvSyncService : Service() {
     private var lastUsageWritePackage: String? = null
     private var lastUsageWriteMs = 0L
     private var lastHardeningAt = 0L
+    private var lastPrefsPruneAt = 0L
     private var lastUploadedActivityCurrent: Map<String, Any?>? = null
     private var lastActivityDbPruneAt = 0L
     private var activityStore: ActivityStore? = null
@@ -1882,6 +1884,13 @@ class TvSyncService : Service() {
     private val tickRunnable = object : Runnable {
         override fun run() {
             SystemTimeGuard.setServerOffset(serverClock.offsetMillis())
+            if (System.currentTimeMillis() - lastPrefsPruneAt >= PREFS_PRUNE_INTERVAL_MS) {
+                lastPrefsPruneAt = System.currentTimeMillis()
+                // Day-keyed prefs were previously pruned only at process start;
+                // a long-lived service never got retention until now.
+                runCatching { localPolicyStore.pruneStaleDays() }
+                runCatching { fallbackStore.pruneStaleKeys() }
+            }
             // 7-8 DPM binder calls per pass; every 30 s on a low-end TV is
             // jank risk for no benefit. ~5 minutes is plenty for drift
             // correction, and the accessibility/usage inputs are monitored
@@ -1890,10 +1899,20 @@ class TvSyncService : Service() {
                 lastHardeningAt = System.currentTimeMillis()
                 policyController.applyHardening()
             }
-            enqueueSyncWork("heartbeat-cycle") {
-                awaitPolicyReconciliation()
-                updateHeartbeat()
-                uploadActivityTelemetry()
+            if (ScreenState.off) {
+                // Display off: usage cannot accrue and the foreground session is
+                // frozen by the accessibility service, so the per-app reconcile
+                // loop and the activity/usage telemetry are guaranteed no-ops.
+                // The heartbeat still writes (parent freshness depends on it)
+                // and stays on the serialized engine loop; control/v2 listener
+                // events bypass this gate, so a parent change while dark applies.
+                enqueueSyncWork("heartbeat-cycle") { updateHeartbeat() }
+            } else {
+                enqueueSyncWork("heartbeat-cycle") {
+                    awaitPolicyReconciliation()
+                    updateHeartbeat()
+                    uploadActivityTelemetry()
+                }
             }
             handler.postDelayed(this, PolicyConstants.HEARTBEAT_INTERVAL_MS)
         }
@@ -1901,7 +1920,11 @@ class TvSyncService : Service() {
 
     private val foregroundUsageRunnable = object : Runnable {
         override fun run() {
-            enqueueSyncWork("usage") { awaitForegroundUsageUpload() }
+            // The live session is frozen while the screen is off, so there is
+            // nothing new to upload.
+            if (!ScreenState.off) {
+                enqueueSyncWork("usage") { awaitForegroundUsageUpload() }
+            }
             handler.postDelayed(this, PolicyConstants.FOREGROUND_USAGE_UPLOAD_INTERVAL_MS)
         }
     }
@@ -1943,6 +1966,7 @@ class TvSyncService : Service() {
         private const val USAGE_UPLOAD_MIN_DELTA_MS = 30_000L
         private const val PROBE_CACHE_TTL_MS = 5 * 60_000L
         private const val HARDENING_INTERVAL_MS = 5 * 60_000L
+        private const val PREFS_PRUNE_INTERVAL_MS = 6L * 60 * 60_000
         private const val ACTIVITY_RETENTION_MS = 30L * 24 * 60 * 60_000
         private const val ACTIVITY_DB_PRUNE_INTERVAL_MS = 24L * 60 * 60_000
         // A claim older than this is by definition from a dead process (command

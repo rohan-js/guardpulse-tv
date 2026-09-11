@@ -305,13 +305,22 @@ class FallbackStateStore(context: Context) {
     }
 
     fun committedUsageMillisToday(dayKey: String = DateKeys.dayKeyUtc(SystemTimeGuard.now())): Map<String, Long> {
-        val raw = prefs.getString("usageLedger:$dayKey", null) ?: return emptyMap()
-        val json = runCatching { JSONObject(raw) }.getOrNull() ?: return emptyMap()
-        return buildMap {
-            json.keys().forEach { packageName ->
-                put(packageName, json.optLong(packageName, 0L).coerceAtLeast(0L))
+        // The daily-limit check reads this every 5 s and the sync tick every
+        // 30 s; parsing the ledger JSON per call was pure GC on the hot path.
+        ledgerMemo?.let { (memoDay, memoMap) -> if (memoDay == dayKey) return memoMap }
+        val raw = prefs.getString("usageLedger:$dayKey", null)
+        val parsed = if (raw == null) {
+            emptyMap()
+        } else {
+            val json = runCatching { JSONObject(raw) }.getOrNull() ?: return emptyMap()
+            buildMap {
+                json.keys().forEach { packageName ->
+                    put(packageName, json.optLong(packageName, 0L).coerceAtLeast(0L))
+                }
             }
         }
+        ledgerMemo = dayKey to parsed
+        return parsed
     }
 
     fun clearLiveForegroundSession(finalize: Boolean = true) {
@@ -338,6 +347,7 @@ class FallbackStateStore(context: Context) {
         val json = JSONObject()
         values.forEach { (packageName, usageMs) -> json.put(packageName, usageMs.coerceAtLeast(0L)) }
         prefs.edit().putString("usageLedger:$dayKey", json.toString()).apply()
+        ledgerMemo = dayKey to values
     }
 
     private fun bootCount(): Int {
@@ -360,8 +370,14 @@ class FallbackStateStore(context: Context) {
                     prefs.getLong(key, 0L) <= now -> { editor.remove(key); pruned = true }
             }
         }
-        if (pruned) editor.apply()
+        if (pruned) {
+            editor.apply()
+            ledgerMemo = null
+        }
     }
+
+    @Volatile
+    private var ledgerMemo: Pair<String, Map<String, Long>>? = null
 
     fun saveSafeMode(until: Long) {
         prefs.edit().putLong("safeModeUntil", until).apply()

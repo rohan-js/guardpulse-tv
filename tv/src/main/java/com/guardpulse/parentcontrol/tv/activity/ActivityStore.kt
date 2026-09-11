@@ -7,7 +7,7 @@ import android.database.sqlite.SQLiteOpenHelper
 import org.json.JSONObject
 
 class ActivityStore(context: Context) :
-    SQLiteOpenHelper(context.applicationContext, "activity_history.db", null, 3) {
+    SQLiteOpenHelper(context.applicationContext, "activity_history.db", null, 4) {
     private val prefs = context.getSharedPreferences("activity_state", Context.MODE_PRIVATE)
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -33,6 +33,7 @@ class ActivityStore(context: Context) :
             """.trimIndent()
         )
         db.execSQL("CREATE INDEX history_started_at ON history(started_at)")
+        db.execSQL("CREATE INDEX history_uploaded_ended_at ON history(uploaded, ended_at)")
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -45,17 +46,38 @@ class ActivityStore(context: Context) :
         // pre-3 installs never got this index (onCreate only); pruneBefore and
         // the pendingHistory ordering both sort/filter on started_at. Idempotent.
         db.execSQL("CREATE INDEX IF NOT EXISTS history_started_at ON history(started_at)")
+        // pendingHistory runs every 30 s tick (`uploaded = 0 ORDER BY ended_at`);
+        // without this it was a full scan + sort of the 30-day table each tick.
+        db.execSQL("CREATE INDEX IF NOT EXISTS history_uploaded_ended_at ON history(uploaded, ended_at)")
     }
 
+    // Process-wide memo: TvActivityTracker and TvSyncService each own an
+    // ActivityStore instance, and the sync tick re-parsing the JSON snapshot
+    // every 30 s was pure waste — both instances live in one process.
     @Synchronized
     fun saveCurrent(snapshot: ActivitySnapshot) {
-        prefs.edit().putString("current", snapshot.toJson().toString()).apply()
+        val raw = snapshot.toJson().toString()
+        prefs.edit().putString("current", raw).apply()
+        memoRaw = raw
+        memoSnapshot = snapshot
     }
 
     @Synchronized
     fun current(): ActivitySnapshot? {
         val raw = prefs.getString("current", null) ?: return null
-        return runCatching { JSONObject(raw).toSnapshot() }.getOrNull()
+        memoSnapshot?.let { memo -> if (memoRaw == raw) return memo }
+        return runCatching { JSONObject(raw).toSnapshot() }.getOrNull()?.also {
+            memoRaw = raw
+            memoSnapshot = it
+        }
+    }
+
+    companion object {
+        @Volatile
+        private var memoRaw: String? = null
+
+        @Volatile
+        private var memoSnapshot: ActivitySnapshot? = null
     }
 
     @Synchronized

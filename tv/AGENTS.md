@@ -21,18 +21,18 @@ affect BOTH clients and possibly the deployed Firebase rules.
 
 ## Current shipped state
 
-- TV: **0.2.8 (versionCode 10)** — the 2026-09-09 full-codebase audit fix set
-  (see `../PROJECT_CONTEXT.md`, section "Authoritative Continuation Handoff (2026-09-03)"
-  plus the audit section). Parent: 0.3.2 (versionCode 5, built but NOT yet
-  installed on the phone).
+- TV: **0.2.9 (versionCode 11)** — the 2026-09-09 audit fix set (0.2.8) plus
+  the 2026-09-11 resource-optimization pass (see `../PROJECT_CONTEXT.md`
+  sections for both). Parent: 0.3.2 (versionCode 5).
 - TV 0.2.8 was INSTALLED on the TV at `192.168.1.6:5555` on 2026-09-10
   (device id `38763e9b-521b-4414-90ba-ef7bb155d58d`) via assembleRelease →
-  zipalign → debug-keystore apksigner → `adb install -r`; data/pairing
-  preserved, services + heartbeat verified after install.
+  zipalign → debug-keystore apksigner → `adb install -r`; 0.2.9 is built but
+  NOT yet installed (user installs manually when asked).
 - Firebase project `rithik-parental-control`; the hardened rules
   (`sessionLimitMinutes` declarations, legacy `policy/*` `$other` guards,
   tamperEvents TV-delete restriction) were DEPLOYED on 2026-09-10 and verified
-  live (heartbeat writes landing, legacy policy nodes readable).
+  live. The web dashboard (`web/`, same repo) is live at
+  https://rithik-parental-control.web.app.
 - TV unit tests green (`./gradlew :tv:testDebugUnitTest`).
 - Full handoff with release-by-release details: `../PROJECT_CONTEXT.md`,
   section "Authoritative Continuation Handoff (2026-09-03)".
@@ -89,12 +89,22 @@ affect BOTH clients and possibly the deployed Firebase rules.
 - `tv/policy/LocalPolicyStore.kt`: SharedPreferences `local_policy` + the
   process-wide policy cache (see hard rule 4). Day keys are UTC on
   SystemTimeGuard time.
+- `tv/system/ScreenState.kt` + the a11y service's screen receiver: while the
+  display is OFF the a11y poll stops, the media probe is released, and the sync
+  tick skips the per-app reconcile + activity/usage telemetry (heartbeat keeps
+  writing — parent freshness depends on it). All enforcement deadlines are
+  timestamp-based, so pausing polls cannot extend or shorten them; if a ROM
+  never broadcasts screen events this degrades to the old always-polling
+  behavior. The poll also relaxes to 5 s after 60 s of event silence.
 - `tv/fallback/AppMonitorAccessibilityService.kt`: the enforcer. Evaluates
   every window event → `SettingsSectionDetector` (section locks) →
   `FallbackProtection.shouldLock` → `LockLaunchGuard` (1.5s dedupe) → opens
   `LockActivity`. Also feeds `TvActivityTracker` (media titles) and live usage
-  sessions. Poll safety-net every 1s; 300ms settle recheck after
-  TYPE_WINDOW_STATE_CHANGED. Since 0.2.8: Settings-section unlock clears only on
+  sessions. Poll safety-net every 1s (5s when idle, stopped when screen off);
+  300ms settle recheck after TYPE_WINDOW_STATE_CHANGED. `rootInActiveWindow` is
+  fetched lazily (only Settings or a due media node-walk needs it);
+  `com.android.systemui` overlay events never finalize the live usage session.
+  Since 0.2.8: Settings-section unlock clears only on
   a real window transition leaving Settings (never on a detector miss — a miss
   used to re-lock mid-visit and hand out a whole-Settings one-visit unlock via
   the fallback wall); `com.android.systemui` events never count as "left the
@@ -110,11 +120,14 @@ affect BOTH clients and possibly the deployed Firebase rules.
   corruption), admin-disable gate, safe mode (server-time hardened).
 - `tv/activity/`: media-title capture. `MediaAccessibilityParser` (pure, the
   title-selection heuristics), `TvActivityTracker` (snapshot cache + SQLite
-  history v3), `MediaTitlePolicy` (evidence-based walk gate), `MediaBrowserProbe`
+  history v4), `MediaTitlePolicy` (evidence-based walk gate), `MediaBrowserProbe`
   (binds apps' MediaBrowserServices), `MediaSessionListenerService` +
   `MediaSessionHub` (system sessions — INERT on the current TV, see blockers),
   `PlaybackAudioMonitor`. Upload channel lives in TvSyncService
-  (`uploadActivityTelemetry`).
+  (`uploadActivityTelemetry`). Since 0.2.9 the tracker persists the current
+  snapshot on MEANINGFUL change only (position-only advances ride a 15 s
+  heartbeat, because the parent extrapolates the playhead client-side) — the
+  old every-event `activity_state` JSON write was the top steady-state cost.
 - `tv/system/SystemTimeGuard.kt`: monotonic clock floor + server offset. ALL
   new deadline logic must use it, not `System.currentTimeMillis()`.
 - `tv/pairing/PairingManager.kt`: pairing code/secret (constant-time compare,

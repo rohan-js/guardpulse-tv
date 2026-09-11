@@ -10,11 +10,16 @@ class TvActivityTracker(private val context: Context) {
     private val store = ActivityStore(context)
     private var pendingMediaSignature: String? = null
     private var pendingMediaCount = 0
+    private var lastPersistAt = 0L
 
-    // Events arrive at high frequency on the accessibility thread; re-parsing
-    // the JSON prefs snapshot per event is pure waste when nothing changed.
-    // The in-memory mirror is written on every persist and reloaded after a
-    // process restart.
+    // PackageManager IPC per accessibility event was pure waste: labels only
+    // matter when the app changes, and they never change during a session.
+    private val labelCache = HashMap<String, String>()
+
+    // Read caches: loadCurrent() sits on the accessibility hot path (every
+    // event), so re-parsing the JSON prefs snapshot per event is pure waste
+    // when nothing changed. The in-memory mirror is written on every persist
+    // and reloaded after a process restart.
     @Volatile
     private var memCurrent: ActivitySnapshot? = null
 
@@ -25,7 +30,34 @@ class TvActivityTracker(private val context: Context) {
 
     private fun persistCurrent(snapshot: ActivitySnapshot) {
         memCurrent = snapshot
+        lastPersistAt = System.currentTimeMillis()
         store.saveCurrent(snapshot)
+    }
+
+    /**
+     * Persist only on meaningful change. A position-only advance is NOT a
+     * meaningful change: the parent extrapolates the playhead from
+     * positionCapturedAt + playbackSpeed, so position rides the heartbeat.
+     * The heartbeat keeps updatedAt (the parent's 90s staleness clock) fresh
+     * even while a video plays with an otherwise static snapshot.
+     */
+    private fun persistIfMeaningful(
+        snapshot: ActivitySnapshot,
+        current: ActivitySnapshot?,
+        now: Long
+    ): Boolean {
+        val realChange = snapshot != current
+        val onlyPosition = realChange && current != null &&
+            snapshot.copy(
+                positionMs = current.positionMs,
+                positionCapturedAt = current.positionCapturedAt
+            ) == current
+        memCurrent = snapshot
+        if ((realChange && !onlyPosition) || now - lastPersistAt >= SNAPSHOT_PERSIST_HEARTBEAT_MS) {
+            persistCurrent(snapshot.copy(updatedAt = now))
+            return true
+        }
+        return false
     }
 
     fun observe(
@@ -52,7 +84,6 @@ class TvActivityTracker(private val context: Context) {
         }
 
         val policyPackage = PolicyConstants.sourceLockPolicyPackage(runtimePackage) ?: runtimePackage
-        val label = appLabel(policyPackage)
         val appChanged = current == null || current.packageName != policyPackage
         var snapshot = if (appChanged) {
             current?.let { closeCurrentSessions(it, now) }
@@ -61,15 +92,17 @@ class TvActivityTracker(private val context: Context) {
             ActivitySnapshot(
                 runtimePackage = runtimePackage,
                 packageName = policyPackage,
-                appLabel = label,
+                appLabel = appLabel(policyPackage),
                 appStartedAt = now,
                 overlayState = ActivitySnapshot.OVERLAY_NONE,
                 updatedAt = now
             )
         } else {
+            // No updatedAt bump here: persistIfMeaningful decides when the
+            // snapshot is worth a disk write (per-event bumps made EVERY
+            // accessibility event a SharedPreferences write during playback).
             requireNotNull(current).withOverlayClosed(now).copy(
-                runtimePackage = runtimePackage,
-                updatedAt = now
+                runtimePackage = runtimePackage
             )
         }
 
@@ -107,15 +140,12 @@ class TvActivityTracker(private val context: Context) {
                     playbackSpeed = if (media.playbackState == MediaObservation.PLAYBACK_PLAYING) 1f else 0f,
                     mediaStartedAt = snapshot.mediaStartedAt ?: now,
                     mediaConfidence = strongerConfidence(snapshot.mediaConfidence, media.confidence),
-                    captureSource = combineCaptureSources(snapshot.captureSource, media.captureSource),
-                    updatedAt = now
+                    captureSource = combineCaptureSources(snapshot.captureSource, media.captureSource)
                 )
             }
         }
 
-        val changed = snapshot != current
-        if (changed) persistCurrent(snapshot)
-        return changed
+        return persistIfMeaningful(snapshot, current, now)
     }
 
     fun current(): ActivitySnapshot? = loadCurrent()
@@ -180,7 +210,7 @@ class TvActivityTracker(private val context: Context) {
             base.playbackSpeed != nextSpeed ||
             base.captureSource != nextSource
         if (!changed) return false
-        persistCurrent(
+        return persistIfMeaningful(
             base.copy(
                 mediaTitle = nextTitle,
                 mediaSubtitle = nextSubtitle,
@@ -190,11 +220,11 @@ class TvActivityTracker(private val context: Context) {
                 playbackSpeed = nextSpeed,
                 captureSource = nextSource,
                 mediaStartedAt = base.mediaStartedAt ?: now,
-                mediaConfidence = strongerConfidence(base.mediaConfidence, MediaObservation.CONFIDENCE_HIGH),
-                updatedAt = now
-            )
+                mediaConfidence = strongerConfidence(base.mediaConfidence, MediaObservation.CONFIDENCE_HIGH)
+            ),
+            current,
+            now
         )
-        return true
     }
 
     fun observeMediaSession(
@@ -229,7 +259,7 @@ class TvActivityTracker(private val context: Context) {
             base.playbackSpeed != nextSpeed ||
             base.captureSource != nextSource
         if (!changed) return false
-        persistCurrent(
+        return persistIfMeaningful(
             base.copy(
                 mediaTitle = nextTitle,
                 mediaSubtitle = nextSubtitle,
@@ -239,21 +269,10 @@ class TvActivityTracker(private val context: Context) {
                 playbackSpeed = nextSpeed,
                 captureSource = nextSource,
                 mediaStartedAt = base.mediaStartedAt ?: now,
-                mediaConfidence = strongerConfidence(base.mediaConfidence, MediaObservation.CONFIDENCE_HIGH),
-                updatedAt = now
-            )
-        )
-        return true
-    }
-
-    fun refreshCurrentForUpload(now: Long = System.currentTimeMillis()) {
-        val current = loadCurrent() ?: return
-        persistCurrent(
-            current.copy(
-                positionMs = current.estimatedPosition(now),
-                positionCapturedAt = current.positionMs?.let { now },
-                updatedAt = now
-            )
+                mediaConfidence = strongerConfidence(base.mediaConfidence, MediaObservation.CONFIDENCE_HIGH)
+            ),
+            current,
+            now
         )
     }
 
@@ -360,7 +379,10 @@ class TvActivityTracker(private val context: Context) {
         return durationMs?.let { estimate.coerceAtMost(it) } ?: estimate
     }
 
-    private fun appLabel(packageName: String): String {
+    private fun appLabel(packageName: String): String =
+        labelCache.getOrPut(packageName) { computeAppLabel(packageName) }
+
+    private fun computeAppLabel(packageName: String): String {
         if (packageName in PolicyConstants.sourceLockPackages) return "Live TV"
         return runCatching {
             val info = context.packageManager.getApplicationInfo(packageName, 0)
@@ -437,6 +459,11 @@ class TvActivityTracker(private val context: Context) {
         private const val MIN_SESSION_MS = 2_000L
         private const val MIN_MEDIA_SESSION_MS = 3_000L
         private const val WINDOW_TITLE_VIEW_ID = "__window_title__"
+
+        // The parent Activity tab treats updatedAt older than 90s as stale, so
+        // a static-but-foreground snapshot must still refresh its clock well
+        // inside that window — 15s, instead of the old every-event write.
+        private const val SNAPSHOT_PERSIST_HEARTBEAT_MS = 15_000L
 
         /** Marker viewId for content-description nodes in title selection. */
         const val CONTENT_DESCRIPTION_VIEW_ID = "__content_desc__"
