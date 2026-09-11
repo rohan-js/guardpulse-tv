@@ -25,3 +25,5 @@ serviceAccount*.json
 *serviceAccount*.json
 .wrangler/
 .zcode/
+web/js/config.local.js
+.firebase/

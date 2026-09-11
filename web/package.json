@@ -1,0 +1,13 @@
+{
+  "name": "guardpulse-web-tests",
+  "private": true,
+  "type": "module",
+  "description": "Unit tests + rules-emulator smoke tests for the GuardPulse web dashboard (zero-build; deps only needed for tests).",
+  "scripts": {
+    "test": "node --test",
+    "test:smoke": "node --test --test-force-exit tests/emulator.smoke.mjs"
+  },
+  "devDependencies": {
+    "firebase": "10.14.1"
+  }
+}

@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#031636" />
+  <title>GuardPulse Dashboard</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script type="importmap">
+    {
+      "imports": {
+        "firebase/app": "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js",
+        "firebase/auth": "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js",
+        "firebase/database": "https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js"
+      }
+    }
+  </script>
+  <!-- Real config (gitignored) must load before the placeholder fallback. -->
+  <script src="js/config.local.js"></script>
+  <script src="js/config.example.js"></script>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="overlay-root"></div>
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
