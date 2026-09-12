@@ -72,7 +72,7 @@
 
 ## 6. KNOWN PITFALLS
 
-1. **Old cwd path is dead**: `D:\UVM\PROJECTS\somthing1\somthgn1\rithik app vscode codex` is an empty husk — the repo moved to `somthing1\guardpulse-tv`.
+1. **Old cwd path is dead**: the pre-move workspace under `D:\UVM\PROJECTS\somthing1\somthgn1\` is an empty husk — the repo lives at `somthing1\guardpulse-tv`.
 2. Subagent/batch edits can flip LF↔CRLF — always verify with `git diff -w --stat`.
 3. Python/heredoc Kotlin edits: use raw strings or escaped backslashes for regex.
 4. JDK 21 absent — never invoke bare `firebase emulators:exec`.

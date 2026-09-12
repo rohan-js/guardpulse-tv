@@ -2,7 +2,7 @@
 
 A zero-build, feature-complete web port of the GuardPulse parent phone app,
 hosted free on Firebase Hosting (Spark tier) inside the existing
-`rithik-parental-control` project. Same Firebase Auth (parent email/password),
+`<your-firebase-project>` project. Same Firebase Auth (parent email/password),
 same Realtime Database rules — **no backend code, no billing**.
 
 ## What it replicates
@@ -77,7 +77,7 @@ fields and revision reuse must be denied).
 ## Deploy
 
 ```
-firebase deploy --only hosting --project rithik-parental-control
+firebase deploy --only hosting --project <your-firebase-project>
 ```
 
 `firebase.json` already contains the hosting block (`public: web`). The

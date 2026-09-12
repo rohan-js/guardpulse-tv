@@ -24,15 +24,16 @@ affect BOTH clients and possibly the deployed Firebase rules.
 - TV: **0.2.9 (versionCode 11)** — the 2026-09-09 audit fix set (0.2.8) plus
   the 2026-09-11 resource-optimization pass (see `../PROJECT_CONTEXT.md`
   sections for both). Parent: 0.3.2 (versionCode 5).
-- TV 0.2.8 was INSTALLED on the TV at `192.168.1.6:5555` on 2026-09-10
-  (device id `38763e9b-521b-4414-90ba-ef7bb155d58d`) via assembleRelease →
-  zipalign → debug-keystore apksigner → `adb install -r`; 0.2.9 is built but
-  NOT yet installed (user installs manually when asked).
-- Firebase project `rithik-parental-control`; the hardened rules
+- TV 0.2.8 was INSTALLED on the family TV on 2026-09-10, and 0.2.9 on
+  2026-09-12, via assembleRelease → zipalign → debug-keystore apksigner →
+  `adb install -r` (data/pairing preserved; device id and LAN address live in
+  the local-only handoff notes, never in this repo).
+- Firebase project `<your-firebase-project>` (see firebase.local.properties /
+  .firebaserc locally); the hardened rules
   (`sessionLimitMinutes` declarations, legacy `policy/*` `$other` guards,
   tamperEvents TV-delete restriction) were DEPLOYED on 2026-09-10 and verified
-  live. The web dashboard (`web/`, same repo) is live at
-  https://rithik-parental-control.web.app.
+  live. The web dashboard (`web/`, same repo) is live on the project's
+  Firebase Hosting URL.
 - TV unit tests green (`./gradlew :tv:testDebugUnitTest`).
 - Full handoff with release-by-release details: `../PROJECT_CONTEXT.md`,
   section "Authoritative Continuation Handoff (2026-09-03)".
@@ -41,10 +42,10 @@ affect BOTH clients and possibly the deployed Firebase rules.
 
 1. **Never bump into a stale signing identity.** The installed TV app and the
    parent phone app are BOTH signed with the ANDROID DEBUG KEYSTORE
-   (`tv-install-backups/debug.keystore`, passwords `android`), not the repo
-   release keystore. Build `assembleRelease`, then zipalign, then
-   `apksigner sign --ks tv-install-backups/debug.keystore --ks-pass
-   pass:android --key-pass pass:android`, then `adb install -r`.
+   (`tv-install-backups/debug.keystore`, passwords on file locally — never in
+   this repo), not the repo release keystore. Build `assembleRelease`, then
+   zipalign, then sign with the debug keystore via `apksigner`, then
+   `adb install -r`.
    A release-signed APK cannot update the device.
 2. **Every Firebase write must match the deployed rules.** The rules use
    `"$other": {".validate": false}` everywhere. Writing ANY field not declared
@@ -53,7 +54,7 @@ affect BOTH clients and possibly the deployed Firebase rules.
    write with "Permission denied". When adding a field: rules JSON + deploy +
    both clients in the same change-set. Validate the JSON
    (`python -c "import json;json.load(open('firebase/database.rules.json'))"`)
-   and deploy: `firebase deploy --only database --project rithik-parental-control`.
+   and deploy: `firebase deploy --only database --project <your-firebase-project>`.
 3. **Never clear app data or uninstall on the TV** unless the user explicitly
    accepts losing pairing, PIN, and accessibility grants. Update with
    `adb install -r` only.
